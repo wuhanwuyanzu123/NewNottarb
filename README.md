@@ -62,6 +62,9 @@ The template is deliberately non-live:
 
 See [PLAN.md](PLAN.md) before changing any of those controls.
 
+For a clean-machine setup from `git clone` through a verified dry run, follow
+[HANDOFF.md](HANDOFF.md).
+
 ## Historical diagnostics
 
 `watch-last.mjs` and `stream-last.mjs` are retained as earlier diagnostics and
