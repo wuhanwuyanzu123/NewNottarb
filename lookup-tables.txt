@@ -1,0 +1,10 @@
+# Address lookup tables observed in NotArb transaction
+# 2xRvK9tU5XEEvWEymP3QLMRPz1uN1LbiCEdMZxizsnNx6ZGcXFkWXdbCXBt7CrzASgra9AHiVzBh9UtFvR57xxFZ
+# on 2026-07-20. All three are active public ALTs. They are not controlled by
+# LAST…, and using one still requires validating that its entries match a route.
+# GFciv…PkZW: 256 entries, authority KARADSaD1txsrM4ZQj1ffnzMM23RfiLnBrqGMA8nWpF
+# 9arKw…tiPNi: 111 entries, authority FfAJbv3prDQUybTNkS3EGaoSbkkbSLy1Eahe5MMxMG9t
+# 9NNTj…rohg: 250 entries, authority Bz3e1MW7mzKQwm6k2CFAkhYtvE3pHZrdZggmNoCbu3Wd
+GFcivC9XqVNS5pmEgZ8sgUL8b2JPbVyPYi5DzGBJPkZW
+9arKwzH776iKFoA2FKGJXmVsKK5m1T6AFM9bEZPtiPNi
+9NNTjz1VhdNew1BVwWnc5MD6sWP2V5THDqqerwocrohg

@@ -1,0 +1,12 @@
+{
+  "name": "last-grpc-observer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "listen:last:grpc": "node ./grpc-last.mjs"
+  },
+  "dependencies": {
+    "@triton-one/yellowstone-grpc": "4.0.2"
+  }
+}

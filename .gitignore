@@ -1,0 +1,27 @@
+# Dependencies and local runtime state
+node_modules/
+*.log
+*.jsonl
+*.tmp
+*.pid
+data/
+
+# Local evidence, debug files, and generated bot state
+.last-*.json
+last-*.json
+*-debug.json
+
+# Never commit a local wallet or credential file. Keep package manifests tracked.
+*.json
+!package.json
+!package-lock.json
+*.key
+*.pem
+.env
+secrets/
+keys/
+
+# Local, runnable configurations may name a local keypair or endpoint.
+notarb-last-grpc-dryrun.toml
+notarb-circular-last-observe.toml
+circular-last-observe.toml

@@ -1,0 +1,78 @@
+# TEMPLATE ONLY — this file cannot safely trade until every REPLACE_* value is
+# supplied for a dedicated wallet you control.  It contains no private key, no
+# Circular API key, no target wallet nonce account, and no enabled strategy.
+#
+# Observed at 2026-07-20 from LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9:
+#   base assets: WSOL / USDC
+#   latest candidate asset: Ge87EtsjwRQbHaqQmKRno69RFTwh9bfSsm99XNxTpump
+#   candidate DEX programs: Pump.fun AMM, Meteora DLMM, Raydium AMM
+#   public ALTs: lookup-tables.txt
+
+[notarb]
+acknowledge_terms_of_service = true
+
+[user]
+# Use a separate funded bot wallet. Do not point this at a wallet without a backup.
+keypair_path = "REPLACE_WITH_YOUR_DEDICATED_KEYPAIR_PATH"
+# Keep false until a verified backup exists. true encrypts and overwrites the keypair.
+protect_keypair = false
+
+# Replace with a paid / dedicated read RPC before operating a bot.
+[blockhash_updater]
+rpc_url = "REPLACE_WITH_YOUR_RPC_URL"
+delay_ms = 500
+
+[price_updater]
+rpc_url = "REPLACE_WITH_YOUR_RPC_URL"
+
+[token_accounts_checker]
+rpc_url = "REPLACE_WITH_YOUR_RPC_URL"
+delay_seconds = 1
+
+[market_loader]
+rpc_url = "REPLACE_WITH_YOUR_RPC_URL"
+
+[lookup_table_loader]
+rpc_url = "REPLACE_WITH_YOUR_RPC_URL"
+
+# This updater only works with durable nonce accounts whose authority is YOUR
+# [user] wallet. Never copy the watched wallet's nonce accounts into this list.
+[nonce_updater]
+rpc_url = "REPLACE_WITH_YOUR_RPC_URL"
+delay_ms = 1000
+
+# Uncomment only after creating and funding nonce accounts owned by your wallet.
+# [[nonce_pool]]
+# id = "main"
+# accounts = ["REPLACE_WITH_YOUR_NONCE_ACCOUNT"]
+
+[[lookup_tables_file]]
+enabled = true
+path = "lookup-tables.txt"
+update_seconds = 30
+
+# The watched address changes candidates over time. This block is intentionally
+# disabled: it is a discovery snapshot, not proof that a route was profitable.
+# [notarb_markets]
+# enabled = true
+# dry_run = true
+# grpc_url = "REPLACE_WITH_YOUR_YELLOWSTONE_GRPC_HOST:PORT"
+# grpc_token = ""
+# update_ms = 5000
+# half_life_ms = 180000
+# include_dexes = [
+#   "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", # Pump.fun AMM
+#   "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo", # Meteora DLMM
+#   "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", # Raydium AMM
+# ]
+
+# Optional Circular Fast sender — keep disabled until an API key and explicit
+# fee limits are available. require_profit=false can still pay a tip on a loss.
+# [[sender]]
+# id = "circular-fast"
+# url = "https://fast.circular.fi/transactions/no-failure/notarb"
+# tip_type = "circular_fast"
+# api_key = "REPLACE_WITH_CIRCULAR_FAST_API_KEY"
+
+# No [[swap]] section is deliberately included. Adding one with enabled=true
+# changes this from observation to a signing/trading configuration.

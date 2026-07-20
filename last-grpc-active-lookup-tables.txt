@@ -1,0 +1,8 @@
+# Public ALT accounts observed by grpc-last.mjs in confirmed transactions for
+# LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9 on 2026-07-20.
+# This list is evidence only: it does not authorize a route or a transaction.
+# Exact per-transaction selected indexes and resolved addresses are in
+# last-grpc-alt-uses.jsonl.
+GVqpNEuBndSygKuT2oNae9xvUksehodqBhtFMnPrhS8z
+GrYRNa8tyCJ34t3Q9VzWwtc8YG7RSwcarYUt4mPyiDt5
+GFcivC9XqVNS5pmEgZ8sgUL8b2JPbVyPYi5DzGBJPkZW
