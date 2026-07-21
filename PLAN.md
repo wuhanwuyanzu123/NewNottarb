@@ -9,6 +9,9 @@
 - The observer normalizes route fingerprints to suppress account-order noise while retaining writable route accounts, and the bridge switches generations only when the validated mint/DEX/pool/ALT set actually changes.
 - The active target is intentionally dynamic. Read `last-target-route.json` together with `last-target-status.json` rather than hard-coding a historical mint or pool group.
 - NotArb `onchain-bot` now loads only that target-specific `markets_file`; the global `[notarb_markets]` scan is disabled and no transaction is sent.
+- `last-notarb-supervisor.mjs` now owns the dry-run lifecycle: it starts one child only after current LAST route activity is bridge-validated, and stops that child after 30 seconds of quiet activity or on any held/stale/mismatched local evidence. The observer records dedicated `lastRoute*` activity fields so unrelated LAST transactions cannot start the child.
+- The direct target-runner wrapper is supervisor-internal and receives the same explicitly passed TOML that the supervisor validates; it rejects a direct launch rather than leaving a quiet-period bot running.
+- `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
 
 ## Current topology
 
@@ -21,8 +24,9 @@
   -> last-target-markets.json
   -> last-target-lookup-tables.txt
   -> last-target-status.json (active/held)
-  -> NotArb [[markets_file]]
-  -> NotArb [[lookup_tables_file]]
+  -> last-notarb-supervisor.mjs (fresh activity lease)
+  -> target-only NotArb child while lease is active
+  -> NotArb [[markets_file]] / [[lookup_tables_file]]
 
 82.39.215.201:8899 Solana JSON-RPC (account/blockhash/ALT reads)
   -> SSH jump 82.23.138.51
@@ -35,9 +39,9 @@
 - A `No arbitrage profit found` transaction is route-intent evidence only. It
   can supply candidate mint/DEX/pool/ALT inputs for dry-run, but it is not an
   executed DEX CPI and does not supply a realized price.
-- Always inspect `last-target-route.json.source.observedAt` before treating the
-  current group as fresh. The bridge deliberately keeps the last valid group
-  when no newer LAST route has arrived.
+- A retained historical group is evidence only. The supervisor treats it as
+  ineligible until `.last-grpc-state.json.lastRouteObservedAt` is fresh and the
+  bridge publishes the same activity signature as `active`.
 - `observedLookupTables` records every ALT in the LAST transaction;
   `selectedLookupTables` is the currently readable subset loaded by NotArb;
   `rejectedLookupTables` is evidence only and is never loaded.
@@ -60,5 +64,7 @@
 Copy-Item .\notarb-last-grpc-dryrun.example.toml .\notarb-last-grpc-dryrun.toml
 # Edit only the local copy to point at a test/unfunded keypair.
 npm run extract:last:markets
-& "$env:LOCALAPPDATA\notarb\bin\notarb.bat" onchain-bot .\notarb-last-grpc-dryrun.toml
+npm run test:last:supervisor
+npm run test:last:bridge
+npm run supervise:last:dryrun
 ```

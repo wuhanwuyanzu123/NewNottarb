@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "listen:last:grpc": "node ./grpc-last.mjs",
-    "extract:last:markets": "node ./last-route-to-notarb.mjs"
+    "extract:last:markets": "node ./last-route-to-notarb.mjs --interval=5000 --max-observer-staleness-seconds=30",
+    "supervise:last:dryrun": "node ./last-notarb-supervisor.mjs",
+    "test:last:supervisor": "node ./test-last-notarb-supervisor.mjs",
+    "test:last:bridge": "node ./test-last-route-bridge.mjs"
   },
   "dependencies": {
     "@triton-one/yellowstone-grpc": "4.0.2"

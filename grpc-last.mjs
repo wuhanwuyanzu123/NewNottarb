@@ -57,11 +57,18 @@ const STATE_SAVE_INTERVAL_MS = 5_000;
 
 let stream;
 let state = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   seen: new Set(),
   lastSlot: null,
   lastSignature: null,
   lastObservedAt: null,
+  // Activity used to control the target-only dry-run lifecycle.  It advances
+  // only for successful NotArb route checks with a candidate mint and DEX,
+  // not for unrelated transactions that merely mention the watched address.
+  lastRouteSlot: null,
+  lastRouteSignature: null,
+  lastRouteObservedAt: null,
+  lastRouteFingerprint: null,
   activeRoute: null,
   knownAltTables: new Set(),
   window: newWindow(),
@@ -426,11 +433,15 @@ async function loadState() {
   try {
     const saved = JSON.parse(await readFile(STATE_PATH, 'utf8'));
     state = {
-      schemaVersion: 3,
+      schemaVersion: 4,
       seen: new Set(saved.seen ?? []),
       lastSlot: saved.lastSlot ?? null,
       lastSignature: saved.lastSignature ?? null,
       lastObservedAt: saved.lastObservedAt ?? null,
+      lastRouteSlot: saved.lastRouteSlot ?? null,
+      lastRouteSignature: saved.lastRouteSignature ?? null,
+      lastRouteObservedAt: saved.lastRouteObservedAt ?? null,
+      lastRouteFingerprint: saved.lastRouteFingerprint ?? null,
       activeRoute: saved.activeRoute ?? null,
       knownAltTables: new Set(saved.knownAltTables ?? []),
       window: saved.window ?? newWindow(),
@@ -444,11 +455,15 @@ async function loadState() {
 
 async function saveState() {
   const payload = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     seen: [...state.seen],
     lastSlot: state.lastSlot,
     lastSignature: state.lastSignature,
     lastObservedAt: state.lastObservedAt,
+    lastRouteSlot: state.lastRouteSlot,
+    lastRouteSignature: state.lastRouteSignature,
+    lastRouteObservedAt: state.lastRouteObservedAt,
+    lastRouteFingerprint: state.lastRouteFingerprint,
     activeRoute: state.activeRoute,
     knownAltTables: [...state.knownAltTables],
     window: state.window,
@@ -501,6 +516,15 @@ function routeFingerprint(event) {
     altSelections,
     writableRouteAccounts,
   });
+}
+
+function isStartableRouteEvidence(event) {
+  return Boolean(
+    event.success
+    && event.notArb?.matched
+    && event.arbitrageIntent?.mints?.length
+    && event.arbitrageIntent?.dexPrograms?.length,
+  );
 }
 
 function recordWindow(event) {
@@ -565,6 +589,12 @@ async function persistEvent(event) {
   state.lastSlot = event.slot;
   state.lastSignature = event.signature;
   state.lastObservedAt = event.observedAt;
+  if (isStartableRouteEvidence(event)) {
+    state.lastRouteSlot = event.slot;
+    state.lastRouteSignature = event.signature;
+    state.lastRouteObservedAt = event.observedAt;
+    state.lastRouteFingerprint = fingerprint;
+  }
   recordWindow(event);
   const summaryEmitted = await maybeEmitSummary(event);
   await maybeSaveState(notable || summaryEmitted);

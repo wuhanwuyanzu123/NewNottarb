@@ -85,7 +85,7 @@ Inspect the generated `last-target-route.json` and `last-target-status.json`
 for the current mint, pool group, ALT set, and whether it is active or held.
 The global NotArb market scanner is not used.
 
-## Start target-specific NotArb in dry run
+## Start activity-gated target-specific NotArb dry run
 
 Create a noncommitted local config and replace only the keypair placeholder
 with your unfunded/test keypair path:
@@ -93,13 +93,16 @@ with your unfunded/test keypair path:
 ```powershell
 Copy-Item .\notarb-last-grpc-dryrun.example.toml .\notarb-last-grpc-dryrun.toml
 notepad .\notarb-last-grpc-dryrun.toml
-& "$env:LOCALAPPDATA\notarb\bin\notarb.bat" onchain-bot .\notarb-last-grpc-dryrun.toml
+npm run supervise:last:dryrun
 ```
 
-For the local target-only instance, `run-notarb-last-target-dryrun.cmd` runs a
-preflight check of the no-send settings before starting the same command.
+For Windows, `run-last-notarb-supervisor.cmd` is the equivalent long-running
+wrapper. It leaves NotArb stopped while LAST is quiet. When fresh LAST route
+activity passes the bridge validation, it starts one child through
+`run-notarb-last-target-dryrun.cmd`; that child performs the no-send preflight
+before invoking NotArb.
 
-Expected output includes the target static group:
+When LAST becomes active, expected NotArb output includes the target group:
 
 ```text
 [markets_file] Groups: 1
@@ -115,6 +118,26 @@ It does **not** send a transaction: the global scanner is disabled, every swap
 is disabled, no sender is configured, the executor has zero threads, and no
 nonce pool exists.
 
+The normal supervisor entry point does not keep a bot alive from a historical
+route. It requires all of the following local evidence to agree: fresh
+`.last-grpc-state.json.lastRoute*`, `last-target-status.json` set to `active`
+for that same activity signature, a matching route generation, and fresh
+`last-target-markets.json` groups identical to the validated route. It stops
+its own child after 30 seconds of quiet activity, immediately when the bridge
+reports `held` or markets go stale. It permits at most seven seconds for a
+route/market publication generation to become coherent before stopping. The
+observer and bridge remain running during those quiet periods.
+`run-notarb-last-target-dryrun.cmd` is supervisor-internal and rejects direct
+launches, so a normal clean-clone workflow cannot accidentally keep a target
+bot running through a quiet LAST period.
+
+Run the local offline lifecycle test after a clean clone:
+
+```powershell
+npm run test:last:supervisor
+npm run test:last:bridge
+```
+
 ## Automatic route changes
 
 No mint or pool is hard-coded in the bot config. The bridge switches to a new
@@ -123,6 +146,8 @@ route ALT through the local read-RPC tunnel. It writes `last-target-status.json`
 with `active` or `held`; a held status preserves the previous group and names
 the reason (for example, unsupported DEX or unreadable ALT). This is expected
 for an unknown protocol and is safer than loading arbitrary accounts.
+The supervisor sees a validated route rotation as an in-place update while
+activity continues; it does not start a second NotArb child.
 
 ## Before any live change
 

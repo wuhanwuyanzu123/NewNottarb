@@ -1,5 +1,7 @@
 # Copy to notarb-last-grpc-dryrun.toml, then set a dedicated wallet path.
 # This is a no-send, LAST-targeted NotArb onchain-bot validation configuration.
+# Start it only through `npm run supervise:last:dryrun`; the direct child
+# wrapper is lifecycle-managed and rejects a normal standalone launch.
 
 [notarb]
 acknowledge_terms_of_service = true

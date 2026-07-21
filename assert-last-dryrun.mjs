@@ -35,7 +35,12 @@ const exactlyOne = (name) => {
 const expect = (sectionValue, key, value) => {
   if (sectionValue.values.get(key) !== value) fail(`[${sectionValue.name}] ${key} must be ${value}.`);
 };
-const enabledPath = (name, path) => named(name).some((item) => item.values.get('enabled') === 'true' && item.values.get('path') === `"${path}"`);
+const exactlyOneEnabledPath = (name, path) => {
+  const enabled = named(name).filter((item) => item.values.get('enabled') === 'true');
+  if (enabled.length !== 1 || enabled[0].values.get('path') !== `"${path}"`) {
+    fail(`Expected exactly one enabled [[${name}]] using ${path}.`);
+  }
+};
 
 const markets = exactlyOne('notarb_markets');
 expect(markets, 'enabled', 'false');
@@ -43,8 +48,8 @@ expect(markets, 'dry_run', 'true');
 expect(exactlyOne('transaction_executor'), 'threads', '0');
 expect(exactlyOne('wsol_unwrapper'), 'enabled', 'false');
 
-if (!enabledPath('markets_file', 'last-target-markets.json')) fail('An enabled [[markets_file]] must use last-target-markets.json.');
-if (!enabledPath('lookup_tables_file', 'last-target-lookup-tables.txt')) fail('An enabled [[lookup_tables_file]] must use last-target-lookup-tables.txt.');
+exactlyOneEnabledPath('markets_file', 'last-target-markets.json');
+exactlyOneEnabledPath('lookup_tables_file', 'last-target-lookup-tables.txt');
 if (named('sender').length) fail('[[sender]] is forbidden in the LAST dry-run config.');
 if (named('nonce_pool').length) fail('[[nonce_pool]] is forbidden in the LAST dry-run config.');
 

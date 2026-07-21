@@ -4,7 +4,9 @@ This project follows the observed route of one address, not the whole chain:
 
 1. `grpc-last.mjs` watches `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through Yellowstone gRPC.
 2. `last-route-to-notarb.mjs` validates the DEX-owned pool-state accounts from those LAST transactions through the same 82 read-RPC tunnel and writes a NotArb `markets_file` plus a route-specific ALT file.
-3. The NotArb dry-run loads only that generated group. The global `[notarb_markets]` stream scanner is disabled.
+3. `last-notarb-supervisor.mjs` starts the NotArb dry-run only during a fresh,
+   bridge-validated LAST activity window, and stops its own child tree when the
+   window closes. The global `[notarb_markets]` stream scanner is disabled.
 
 No other project is used.
 
@@ -26,7 +28,7 @@ it is not a transaction sender.
 ## LAST observer
 
 ```powershell
-npm install
+npm ci --ignore-scripts
 npm run listen:last:grpc
 ```
 
@@ -79,6 +81,10 @@ Meteora DLMM/CPMM, and Raydium AMM v4. A newly observed protocol is surfaced
 in `unsupportedCandidateDexPrograms`; it must receive an explicit verified
 pool layout before it can be loaded.
 
+A retained group is evidence only while the watcher is quiet. The lifecycle
+supervisor requires fresh route activity plus a matching `active` bridge status
+before it starts its child; `held` immediately ends that child activity.
+
 The runtime source of truth is always the ignored `last-target-route.json` and
 `last-target-status.json`, not the illustrative addresses below.
 
@@ -99,21 +105,45 @@ the time this example was recorded, the first two were valid and went into
 currently absent, so it is reported under `rejectedLookupTables` in
 `last-target-route.json` and is not sent to NotArb.
 
-## Native NotArb onchain-bot dry run
+## Activity-gated NotArb dry run
 
 Copy the safe template locally, set an unfunded/test keypair path, keep the
-bridge running, then start NotArb:
+observer and bridge running, then start the lifecycle supervisor:
 
 ```powershell
 Copy-Item .\notarb-last-grpc-dryrun.example.toml .\notarb-last-grpc-dryrun.toml
-npm run extract:last:markets
-& "$env:LOCALAPPDATA\notarb\bin\notarb.bat" onchain-bot .\notarb-last-grpc-dryrun.toml
+npm run supervise:last:dryrun
 ```
 
-`run-notarb-last-target-dryrun.cmd` is a Windows wrapper for that last command.
-It first checks the local config still has the target-only/no-send controls,
-then writes the canonical `notarb-last-target-dryrun.*.log` files used by the
-monitor.
+`run-last-notarb-supervisor.cmd` is the Windows wrapper. It reads only local
+observer/bridge evidence and uses `run-notarb-last-target-dryrun.cmd` for a
+child start. That child wrapper still checks the local target-only/no-send
+config before it launches NotArb and writes the canonical
+`notarb-last-target-dryrun.*.log` files.
+
+The normal lifecycle is:
+
+1. A successful LAST NotArb route check with a mint and DEX updates
+   `.last-grpc-state.json.lastRoute*`.
+2. The bridge validates the route and publishes `status: "active"` with a
+   matching activity signature, exact pool group, and route-specific ALT set.
+3. The supervisor starts one target-only dry-run child. It keeps that child
+   running while LAST activity remains fresh.
+4. After 30 seconds without a new qualifying LAST route check, or immediately
+   on `held` or stale markets, the supervisor stops only the child tree it
+   created. A route/market publication mismatch gets at most a seven-second
+   coherence grace while the bridge atomically finishes the next generation.
+
+The supervisor does not revive a stale historical group. A fresh activity must
+pass the bridge gates again. During continuous activity, a validated route
+rotation updates the market/ALT files in place rather than creating duplicate
+NotArb children. `npm run test:last:supervisor` is an offline fake-child test
+for this start → stay-running → quiet-stop → restart behavior;
+`npm run test:last:bridge` verifies the bridge ignores an unfinished JSONL tail
+and never promotes a mint-only, no-DEX event into a route.
+
+`run-notarb-last-target-dryrun.cmd` is an internal child runner and rejects a
+direct launch; use the supervisor entry point for every normal run.
 
 The template is deliberately non-live:
 

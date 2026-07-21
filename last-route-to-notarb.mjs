@@ -112,10 +112,26 @@ async function rpc(method, params) {
 
 async function loadLatestLastEvent() {
   const text = await readFile(EVENTS_PATH, 'utf8');
-  const events = text.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  const lines = text.split(/\r?\n/);
+  const endsWithNewline = /\r?\n$/.test(text);
+  const events = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (!line) continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch (error) {
+      // appendFile can be observed between the bytes of its final JSONL row.
+      // Ignore only that unfinished tail; a malformed completed row remains a
+      // hard failure rather than silently selecting arbitrary evidence.
+      if (index === lines.length - 1 && !endsWithNewline) continue;
+      throw error;
+    }
+  }
   for (const event of events.reverse()) {
     if (event.watch?.address !== WATCHED_ADDRESS) continue;
-    if (!event.success || !event.notArb?.matched || !event.accountKeys?.length || !candidateMints(event).length) continue;
+    const dexPrograms = event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [];
+    if (!event.success || !event.notArb?.matched || !event.accountKeys?.length || !candidateMints(event).length || !dexPrograms.length) continue;
     return event;
   }
   throw new Error(`No route evidence for ${WATCHED_ADDRESS} in ${EVENTS_PATH}`);
@@ -168,6 +184,32 @@ function routeFingerprint(event) {
   });
 }
 
+// This intentionally matches grpc-last.mjs:routeFingerprint.  It lets the
+// bridge prove that a newer unlogged no-profit check has the same complete
+// route evidence as the latest durable snapshot before reusing its pool set.
+function routeEvidenceFingerprint(event) {
+  const sortIndexes = (indexes) => [...(indexes ?? [])].sort((left, right) => left - right);
+  const altSelections = (event.addressLookupTables ?? [])
+    .map((table) => ({
+      address: table.address,
+      writableIndexes: sortIndexes(table.writableIndexes),
+      readonlyIndexes: sortIndexes(table.readonlyIndexes),
+    }))
+    .sort((left, right) => left.address.localeCompare(right.address));
+  const writableRouteAccounts = (event.accountKeys ?? [])
+    .filter((key) => key.writable && !key.signer)
+    .map((key) => key.pubkey)
+    .sort();
+  return JSON.stringify({
+    mints: candidateMints(event).map((item) => item.mint).sort(),
+    intendedDexes: (event.arbitrageIntent?.dexPrograms ?? []).map((item) => item.programId).sort(),
+    invokedDexes: (event.execution?.invokedPrograms ?? []).map((item) => item.programId).sort(),
+    executionKind: event.execution?.kind ?? null,
+    altSelections,
+    writableRouteAccounts,
+  });
+}
+
 function unsupportedCandidateDexes(event) {
   return (event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [])
     .filter((program) => !POOL_LAYOUTS.has(program.programId));
@@ -175,10 +217,22 @@ function unsupportedCandidateDexes(event) {
 
 async function observerLiveness(fallbackObservedAt = null) {
   const observer = await readJsonIfPresent(OBSERVER_STATE_PATH);
-  const lastObservedAt = observer?.lastObservedAt ?? fallbackObservedAt;
+  const hasRouteActivity = Object.prototype.hasOwnProperty.call(observer ?? {}, 'lastRouteObservedAt');
+  const lastObservedAt = hasRouteActivity
+    ? observer.lastRouteObservedAt ?? fallbackObservedAt
+    : observer?.lastObservedAt ?? fallbackObservedAt;
   const ageMs = lastObservedAt ? Date.now() - Date.parse(lastObservedAt) : null;
   return {
     lastObservedAt,
+    lastSignature: hasRouteActivity
+      ? observer?.lastRouteSignature ?? null
+      : observer?.lastSignature ?? null,
+    lastSlot: hasRouteActivity
+      ? observer?.lastRouteSlot ?? null
+      : observer?.lastSlot ?? null,
+    routeEvidenceFingerprint: hasRouteActivity
+      ? observer?.lastRouteFingerprint ?? null
+      : null,
     stale: ageMs !== null && (!Number.isFinite(ageMs) || ageMs > MAX_OBSERVER_STALENESS_MS),
   };
 }
@@ -258,13 +312,53 @@ function activeFingerprint(event, groups, lookupTables) {
 
 async function publishStatus(status) {
   const previous = await readJsonIfPresent(STATUS_PATH);
-  if (previous?.fingerprint === status.fingerprint) return false;
+  const sameActivity = previous?.activity?.signature === status.activity?.signature
+    && previous?.activity?.observedAt === status.activity?.observedAt
+    && previous?.activity?.routeEvidenceFingerprint === status.activity?.routeEvidenceFingerprint;
+  if (previous?.fingerprint === status.fingerprint
+    && previous?.status === status.status
+    && previous?.reason === status.reason
+    && sameActivity) return false;
   await writeJsonAtomically(STATUS_PATH, {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     ...status,
   });
   return true;
+}
+
+async function refreshActiveMarketsHeartbeat() {
+  const current = await readJsonIfPresent(MARKETS_PATH);
+  const groups = current?.groups;
+  if (!Array.isArray(groups) || groups.length === 0) return false;
+  // NotArb treats markets_file.update_timestamp as a liveness heartbeat. This
+  // is called only after a current, fully validated LAST route has passed all
+  // gates below; a quiet or held observer must never keep a bot alive.
+  await writeJsonAtomically(MARKETS_PATH, { update_timestamp: Date.now(), groups });
+  return true;
+}
+
+function observerActivity(observer, fallbackSource, fallbackRouteEvidenceFingerprint) {
+  return {
+    signature: observer.lastSignature ?? fallbackSource.signature,
+    slot: observer.lastSlot ?? fallbackSource.slot,
+    observedAt: observer.lastObservedAt ?? fallbackSource.observedAt,
+    routeEvidenceFingerprint: observer.routeEvidenceFingerprint ?? fallbackRouteEvidenceFingerprint,
+  };
+}
+
+async function ensureRouteEvidenceFingerprint(eventEvidenceFingerprint, observer) {
+  const current = await readJsonIfPresent(ROUTE_PATH);
+  if (!current || current.automation?.routeEvidenceFingerprint === eventEvidenceFingerprint) return;
+  await writeJsonAtomically(ROUTE_PATH, {
+    ...current,
+    automation: {
+      ...current.automation,
+      routeEvidenceFingerprint: eventEvidenceFingerprint,
+      observerLastSeenAt: observer.lastObservedAt,
+      bridgeIntervalMs: INTERVAL_MS,
+    },
+  });
 }
 
 function observedLookupTables(event) {
@@ -305,8 +399,10 @@ async function build() {
   const event = await loadLatestLastEvent();
   const source = routeSource(event);
   const routeId = routeFingerprint(event);
+  const eventEvidenceFingerprint = routeEvidenceFingerprint(event);
   const bridgeState = await readJsonIfPresent(BRIDGE_STATE_PATH);
   const observer = await observerLiveness(event.observedAt);
+  const activity = observerActivity(observer, source, eventEvidenceFingerprint);
   const candidateDexPrograms = event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [];
   const unsupportedDexPrograms = unsupportedCandidateDexes(event);
   const hold = async (reason, details = {}) => {
@@ -317,6 +413,7 @@ async function build() {
       fingerprint: statusFingerprint,
       source,
       observer,
+      activity,
       activeTarget: bridgeState
         ? { generation: bridgeState.generation, source: bridgeState.source }
         : null,
@@ -327,6 +424,13 @@ async function build() {
 
   if (observer.stale) {
     await hold('observer_stale', { maxObserverStalenessMs: MAX_OBSERVER_STALENESS_MS });
+    return;
+  }
+  if (observer.routeEvidenceFingerprint && observer.routeEvidenceFingerprint !== eventEvidenceFingerprint) {
+    await hold('observer_route_snapshot_pending', {
+      observerRouteEvidenceFingerprint: observer.routeEvidenceFingerprint,
+      latestSnapshotRouteEvidenceFingerprint: eventEvidenceFingerprint,
+    });
     return;
   }
   if (unsupportedDexPrograms.length) {
@@ -357,6 +461,8 @@ async function build() {
 
   const activeRouteFingerprint = activeFingerprint(event, groups, lookupTables);
   if (bridgeState?.activeFingerprint === activeRouteFingerprint) {
+    await refreshActiveMarketsHeartbeat();
+    await ensureRouteEvidenceFingerprint(eventEvidenceFingerprint, observer);
     await publishStatus({
       status: 'active',
       reason: 'unchanged',
@@ -364,6 +470,7 @@ async function build() {
       generation: bridgeState.generation,
       source: bridgeState.source,
       observer,
+      activity,
     });
     return;
   }
@@ -396,6 +503,7 @@ async function build() {
       fingerprint: activeRouteFingerprint,
       observerLastSeenAt: observer.lastObservedAt,
       bridgeIntervalMs: INTERVAL_MS,
+      routeEvidenceFingerprint: eventEvidenceFingerprint,
     },
   };
   await writeJsonAtomically(ROUTE_PATH, route);
@@ -417,6 +525,7 @@ async function build() {
     generation,
     source,
     observer,
+    activity,
     targetMints: targets.map((target) => target.mint),
     candidateDexPrograms,
     lookupTables,

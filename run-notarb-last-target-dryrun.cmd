@@ -1,7 +1,16 @@
 @echo off
-REM Start only after assert-last-dryrun.mjs confirms this stays target-only/no-send.
+REM Internal child runner for last-notarb-supervisor.mjs only.
 setlocal
 cd /d "%~dp0"
-node.exe "%~dp0assert-last-dryrun.mjs" "%~dp0notarb-last-grpc-dryrun.toml" 1>>"%~dp0notarb-last-target-dryrun.stdout.log" 2>>"%~dp0notarb-last-target-dryrun.stderr.log"
+set "CONFIG=%~1"
+if not "%~2"=="--managed-by-last-supervisor" (
+  echo {"status":"last_dry_run_start_rejected","reason":"use_run-last-notarb-supervisor.cmd"} 1>>"%~dp0notarb-last-target-dryrun.stderr.log"
+  exit /b 2
+)
+if "%CONFIG%"=="" (
+  echo {"status":"last_dry_run_start_rejected","reason":"missing_supervisor_config"} 1>>"%~dp0notarb-last-target-dryrun.stderr.log"
+  exit /b 2
+)
+node.exe "%~dp0assert-last-dryrun.mjs" "%CONFIG%" 1>>"%~dp0notarb-last-target-dryrun.stdout.log" 2>>"%~dp0notarb-last-target-dryrun.stderr.log"
 if errorlevel 1 exit /b %errorlevel%
-call "%LOCALAPPDATA%\notarb\bin\notarb.bat" onchain-bot "%~dp0notarb-last-grpc-dryrun.toml" 1>>"%~dp0notarb-last-target-dryrun.stdout.log" 2>>"%~dp0notarb-last-target-dryrun.stderr.log"
+call "%LOCALAPPDATA%\notarb\bin\notarb.bat" onchain-bot "%CONFIG%" 1>>"%~dp0notarb-last-target-dryrun.stdout.log" 2>>"%~dp0notarb-last-target-dryrun.stderr.log"
