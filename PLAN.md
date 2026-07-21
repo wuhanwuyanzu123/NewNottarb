@@ -14,6 +14,8 @@
 - `notarb-last-grpc-live.example.toml`, `assert-last-live.mjs`, and the live wrappers provide a local ignored Jito-sender profile with one executor, an enabled SOL strategy, and `flash_loan = true`.
 - `rust/last-route-bridge` is a compiled WSL route bridge. It owns the compact route lease, validates the same target-only pools/ALTs through the local tunnel, and includes Orca Whirlpool's 653-byte pool layout. `run-last-rust-pipeline.sh` launches the WSL observer in append-only mode plus that Rust bridge.
 - When the validated market generation is unchanged but a new LAST route check has different ALT indexes or writable account metas, the Rust bridge refreshes the route-evidence fingerprint before publishing the renewed active lease. This keeps the observer, route record, and supervisor coherent without creating a duplicate generation.
+- The supervisor uses local status/markets file mtimes, not WSL payload timestamps, for a 20-second markets heartbeat and activity freshness; `held` and stale route status still end the child lease immediately.
+- A lifecycle activation key combines generation and LAST signature. The supervisor never relaunches a stopped/failed child for that same key after a transient publication gap; the next fresh validated signature is required for another child.
 - `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
 
 ## Current topology

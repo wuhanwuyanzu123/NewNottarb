@@ -10,7 +10,7 @@
  * whether the child is a dry-run or a live sender.
  */
 
-import { readFile, rename, writeFile } from 'node:fs/promises';
+import { readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve } from 'node:path';
@@ -30,14 +30,20 @@ const RUNNER_PATH = resolve(ROOT, args.get('runner') ?? 'run-notarb-last-target-
 const STATE_PATH = resolve(ROOT, args.get('state') ?? '.last-notarb-supervisor-state.json');
 const POLL_MS = boundedNumber(args.get('poll-ms'), 1_000, 250, 30_000);
 const IDLE_MS = boundedNumber(args.get('idle-seconds'), 30, 5, 600) * 1_000;
-const MAX_MARKETS_AGE_MS = boundedNumber(args.get('max-markets-age-seconds'), 12, 2, 120) * 1_000;
+// The bridge writes the heartbeat from WSL while this supervisor runs on
+// Windows. Leave room for the normal five-second bridge interval and a small
+// cross-runtime clock offset; a held/stale route still stops the child
+// immediately through the status gate below.
+const MAX_MARKETS_AGE_MS = boundedNumber(args.get('max-markets-age-seconds'), 20, 2, 120) * 1_000;
 const TRANSITION_GRACE_MS = boundedNumber(args.get('transition-grace-ms'), 7_000, 500, 15_000);
 const ONCE = args.has('once');
 
 let stopping = false;
 let ticking = false;
 let ownedBot = null;
-let previousEligibility = false;
+// A delivery signature/generation may start at most one child. Retain this
+// across a temporary held/stale publication so a bridge heartbeat flap cannot
+// re-launch the same live activity after its child has been stopped.
 let attemptedActivationKey = null;
 let lastAnnouncement = null;
 let transientIneligibleSince = null;
@@ -155,12 +161,16 @@ async function currentEligibility() {
   let observer;
   let route;
   let markets;
+  let statusFile;
+  let marketsFile;
   try {
-    [status, observer, route, markets] = await Promise.all([
+    [status, observer, route, markets, statusFile, marketsFile] = await Promise.all([
       readJson(STATUS_PATH),
       readJson(OBSERVER_STATE_PATH),
       readJson(ROUTE_PATH),
       readJson(MARKETS_PATH),
+      stat(STATUS_PATH),
+      stat(MARKETS_PATH),
     ]);
   } catch (error) {
     return eligibleFailure('evidence_unreadable', { error: String(error.message ?? error) });
@@ -176,8 +186,15 @@ async function currentEligibility() {
       observerSignature: observer.lastRouteSignature,
     });
   }
-  if (!freshTimestamp(activity.observedAt, IDLE_MS)) {
-    return eligibleFailure('route_activity_stale', { activityObservedAt: activity.observedAt, idleMs: IDLE_MS });
+  // `observedAt` is produced inside WSL while this supervisor uses the
+  // Windows clock. The local status-file mtime is the host-clock receipt of
+  // the bridge's active lease, so it is the reliable freshness source here.
+  if (!freshTimestamp(statusFile.mtimeMs, IDLE_MS)) {
+    return eligibleFailure('route_activity_stale', {
+      activityObservedAt: activity.observedAt,
+      statusMtimeMs: statusFile.mtimeMs,
+      idleMs: IDLE_MS,
+    });
   }
   if (!activity.routeEvidenceFingerprint || !observer.lastRouteFingerprint) {
     return eligibleFailure('missing_route_evidence_fingerprint');
@@ -207,8 +224,14 @@ async function currentEligibility() {
   if (!canonicalGroups(route.selectedGroups) || !equalGroups(route.selectedGroups, markets?.groups)) {
     return eligibleFailure('markets_do_not_match_validated_route');
   }
-  if (!freshTimestamp(markets?.update_timestamp, MAX_MARKETS_AGE_MS)) {
-    return eligibleFailure('markets_heartbeat_stale', { maxMarketsAgeMs: MAX_MARKETS_AGE_MS });
+  // Keep `update_timestamp` for NotArb's markets schema, but use the local
+  // file mtime for the supervisor lease to avoid WSL/Windows clock skew.
+  if (!freshTimestamp(marketsFile.mtimeMs, MAX_MARKETS_AGE_MS)) {
+    return eligibleFailure('markets_heartbeat_stale', {
+      marketsUpdateTimestamp: markets?.update_timestamp ?? null,
+      marketsMtimeMs: marketsFile.mtimeMs,
+      maxMarketsAgeMs: MAX_MARKETS_AGE_MS,
+    });
   }
 
   return {
@@ -516,13 +539,11 @@ async function reconcile() {
         }
       }
       transientIneligibleSince = null;
-      previousEligibility = false;
       await stopOwnedBot(eligibility.reason);
       announce('notarb_waiting', { reason: eligibility.reason });
       return;
     }
 
-    if (!previousEligibility) attemptedActivationKey = null;
     transientIneligibleSince = null;
     const rootStatus = ownedBot ? await ownedRootStatus(ownedBot) : 'missing';
     if (ownedBot && rootStatus !== 'alive') {
@@ -546,7 +567,6 @@ async function reconcile() {
         reason: rootStatus === 'missing' ? 'owned_runner_no_longer_exists' : 'owned_runner_pid_reused',
       }, true);
     }
-    previousEligibility = true;
     if (ownedBot) {
       if (ownedBot.activationKey !== eligibility.activationKey) {
         ownedBot.activationKey = eligibility.activationKey;
@@ -583,7 +603,6 @@ async function reconcile() {
       announce('notarb_start_failed', { activationKey: eligibility.activationKey, error: String(error.message ?? error) }, true);
     }
   } catch (error) {
-    previousEligibility = false;
     transientIneligibleSince = null;
     announce('supervisor_reconcile_error', { error: String(error.message ?? error) }, true);
     try {

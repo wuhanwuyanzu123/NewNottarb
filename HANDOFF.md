@@ -88,6 +88,15 @@ generation and refreshes `last-target-route.json.automation.routeEvidenceFingerp
 before it publishes the active lease. That exact three-way fingerprint match is
 required by `last-notarb-supervisor.mjs` before it starts or keeps a child.
 
+The Windows supervisor evaluates the local status/markets file mtimes for
+lease freshness instead of comparing WSL payload timestamps to the host clock.
+It permits a 20-second markets heartbeat by default and still stops immediately
+when the route status becomes `held` or stale.
+
+An activity key is the route generation plus observed signature. Once its
+child has been attempted, a temporary heartbeat loss cannot relaunch that same
+key; the next launch requires a new validated activity key.
+
 ## Build the LAST-only NotArb markets file
 
 In a fourth PowerShell window, keep the bridge running:

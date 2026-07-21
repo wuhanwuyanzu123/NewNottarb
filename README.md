@@ -183,6 +183,14 @@ the route-evidence fingerprint in `last-target-route.json`. This keeps the
 observer, route record, and supervisor activity evidence coherent without
 starting a duplicate NotArb child.
 
+The lifecycle supervisor uses the local Windows mtimes of the bridge-written
+status and markets files for lease freshness, rather than comparing WSL payload
+timestamps to the Windows clock. Its markets heartbeat default is 20 seconds;
+a `held` or stale route status still stops the child immediately.
+If a heartbeat gap stops a child, the supervisor records that activity key and
+will not start it again for the same generation/signature. Only a new validated
+LAST activity key may launch the next child.
+
 ## Activity-gated live sender and flash loan
 
 `notarb-last-grpc-live.example.toml` is the tracked LAST-only live profile.

@@ -15,6 +15,11 @@ const ASSERT = resolve(ROOT, 'assert-last-dryrun.mjs');
 const directory = await mkdtemp(join(tmpdir(), 'last-notarb-supervisor-'));
 const groups = [['PoolA111111111111111111111111111111111111111', 'PoolB111111111111111111111111111111111111111']];
 const routeEvidenceFingerprint = 'fixture-route-evidence';
+const refreshedRouteEvidenceFingerprint = 'fixture-route-evidence-refreshed';
+// The production bridge runs in WSL while the supervisor runs on Windows.
+// Exercise the observed small clock offset so a five-second heartbeat does
+// not make a valid active lease flap.
+const bridgeClockSkewMs = 8_000;
 const execFileAsync = promisify(execFile);
 
 async function writeJson(path, value) {
@@ -23,28 +28,59 @@ async function writeJson(path, value) {
   await rename(temporary, path);
 }
 
-async function writeActivity(signature, generation = 1) {
+async function writeRoute(generation, fingerprint, signature) {
+  await writeJson(join(directory, 'last-target-route.json'), {
+    source: { watchedAddress: 'LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9', signature },
+    automation: { generation, routeEvidenceFingerprint: fingerprint },
+    candidateDexPrograms: [{ programId: 'fixture-dex', label: 'Fixture DEX' }],
+    unsupportedCandidateDexPrograms: [],
+    rejectedLookupTables: [],
+    selectedGroups: groups,
+    targets: [{ mint: 'TargetMint11111111111111111111111111111111111' }],
+  });
+}
+
+function activityRecord(signature, generation, fingerprint) {
   const observedAt = new Date().toISOString();
-  await Promise.all([
-    writeJson(join(directory, '.last-grpc-state.json'), {
-      schemaVersion: 4,
-      lastRouteSignature: signature,
-      lastRouteSlot: '1',
-      lastRouteObservedAt: observedAt,
-      lastRouteFingerprint: routeEvidenceFingerprint,
-    }),
-    writeJson(join(directory, 'last-target-status.json'), {
-      schemaVersion: 1,
-      status: 'active',
-      reason: 'unchanged',
-      generation,
-      activity: { signature, slot: '1', observedAt, routeEvidenceFingerprint },
-    }),
-    writeJson(join(directory, 'last-target-markets.json'), {
-      update_timestamp: Date.now(),
-      groups,
-    }),
-  ]);
+  return { signature, generation, fingerprint, observedAt };
+}
+
+async function writeObserverActivity(activity) {
+  await writeJson(join(directory, '.last-grpc-state.json'), {
+    schemaVersion: 4,
+    lastRouteSignature: activity.signature,
+    lastRouteSlot: '1',
+    lastRouteObservedAt: activity.observedAt,
+    lastRouteFingerprint: activity.fingerprint,
+  });
+}
+
+async function writeActiveStatus(activity) {
+  await writeJson(join(directory, 'last-target-status.json'), {
+    schemaVersion: 1,
+    status: 'active',
+    reason: 'unchanged',
+    generation: activity.generation,
+    activity: {
+      signature: activity.signature,
+      slot: '1',
+      observedAt: activity.observedAt,
+      routeEvidenceFingerprint: activity.fingerprint,
+    },
+  });
+}
+
+async function writeMarketsHeartbeat(payloadAgeMs = bridgeClockSkewMs) {
+  await writeJson(join(directory, 'last-target-markets.json'), {
+    update_timestamp: Date.now() - payloadAgeMs,
+    groups,
+  });
+}
+
+async function writeActivity(signature, generation = 1, fingerprint = routeEvidenceFingerprint) {
+  const activity = activityRecord(signature, generation, fingerprint);
+  await Promise.all([writeObserverActivity(activity), writeActiveStatus(activity), writeMarketsHeartbeat()]);
+  return activity;
 }
 
 async function waitUntil(predicate, message, timeoutMs = 8_000) {
@@ -143,15 +179,7 @@ await appendFile(path, 'started\\n');
 setInterval(() => undefined, 1000);
 `, 'utf8');
   await writeFile(join(directory, 'run-fake.cmd'), `@echo off\r\necho %~1>"%~dp0runner-config.log"\r\necho %~2>"%~dp0runner-supervisor.log"\r\nnode.exe "%~dp0fake-child.mjs" "%~dp0fake-child-events.log" 1>>"%~dp0fake-child.stdout.log" 2>>"%~dp0fake-child.stderr.log"\r\n`, 'utf8');
-  await writeJson(join(directory, 'last-target-route.json'), {
-    source: { watchedAddress: 'LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9', signature: 'fixture-route-source' },
-    automation: { generation: 1, routeEvidenceFingerprint },
-    candidateDexPrograms: [{ programId: 'fixture-dex', label: 'Fixture DEX' }],
-    unsupportedCandidateDexPrograms: [],
-    rejectedLookupTables: [],
-    selectedGroups: groups,
-    targets: [{ mint: 'TargetMint11111111111111111111111111111111111' }],
-  });
+  await writeRoute(1, routeEvidenceFingerprint, 'fixture-route-source');
   await writeActivity('activity-before-start');
   await writeJson(join(directory, 'last-target-status.json'), { schemaVersion: 1, status: 'held', reason: 'fixture_initial_hold' });
 
@@ -161,8 +189,7 @@ setInterval(() => undefined, 1000);
     `--assert=${ASSERT}`,
     `--runner=${join(directory, 'run-fake.cmd')}`,
     '--poll-ms=100',
-    '--idle-seconds=5',
-    '--max-markets-age-seconds=5',
+    '--idle-seconds=10',
   ], { cwd: directory, windowsHide: true, stdio: 'pipe' });
   supervisor.stdout.on('data', (chunk) => { supervisorStdout += chunk; });
   supervisor.stderr.on('data', (chunk) => { supervisorStderr += chunk; });
@@ -173,32 +200,51 @@ setInterval(() => undefined, 1000);
   await waitUntil(async () => (await startCount()) === 1, 'first_fake_child_start');
   if (await fixtureLog('runner-config.log') !== join(directory, 'notarb-last-grpc-dryrun.toml')) throw new Error('runner_received_different_config_than_supervisor_validated');
   if (await fixtureLog('runner-supervisor.log') !== '--managed-by-last-supervisor') throw new Error('runner_missing_supervisor_lifecycle_marker');
+  // The JSON payload timestamp belongs to the markets schema and may be on the
+  // WSL clock. A freshly written local file with an intentionally old payload
+  // must stay live; the supervisor gates on the host mtime.
+  await writeMarketsHeartbeat(60_000);
+  await pause(300);
+  if (await supervisorPhase() !== 'running' || await startCount() !== 1) throw new Error('treated_payload_timestamp_as_host_heartbeat');
+  // A five-second bridge cadence plus the modeled eight-second WSL clock skew
+  // must remain a live lease under the default 20-second heartbeat tolerance.
+  await pause(5_500);
+  if (await supervisorPhase() !== 'running' || await startCount() !== 1) throw new Error('stopped_during_skewed_bridge_heartbeat_gap');
+  // Mirror the Rust unchanged-generation commit sequence: observer evidence
+  // changes first, then the route automation fingerprint/markets, then active
+  // status. The managed child must stay alive and see the route in place.
+  const refreshedActivity = activityRecord('activity-fingerprint-refresh', 1, refreshedRouteEvidenceFingerprint);
+  await writeObserverActivity(refreshedActivity);
+  await pause(150);
+  await writeRoute(1, refreshedRouteEvidenceFingerprint, 'fixture-route-source-refreshed');
+  await writeMarketsHeartbeat();
+  await writeActiveStatus(refreshedActivity);
+  await pause(500);
+  if (await supervisorPhase() !== 'running' || await startCount() !== 1) throw new Error('stopped_or_restarted_during_fingerprint_refresh');
   for (let index = 0; index < 3; index += 1) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 300));
-    await writeActivity(`activity-live-${index}`);
+    await writeActivity(`activity-live-${index}`, 1, refreshedRouteEvidenceFingerprint);
   }
   await new Promise((resolveWait) => setTimeout(resolveWait, 500));
   if (await startCount() !== 1) throw new Error('duplicate_start_during_continuous_activity');
 
   // The bridge writes route/markets before the new active status.  A short
   // generation mismatch must not tear down the already-running child.
-  await writeJson(join(directory, 'last-target-route.json'), {
-    source: { watchedAddress: 'LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9', signature: 'fixture-route-source-two' },
-    automation: { generation: 2, routeEvidenceFingerprint },
-    candidateDexPrograms: [{ programId: 'fixture-dex', label: 'Fixture DEX' }],
-    unsupportedCandidateDexPrograms: [],
-    rejectedLookupTables: [],
-    selectedGroups: groups,
-    targets: [{ mint: 'TargetMint11111111111111111111111111111111111' }],
-  });
+  await writeRoute(2, refreshedRouteEvidenceFingerprint, 'fixture-route-source-two');
   await pause(500);
   if (await supervisorPhase() !== 'running' || await startCount() !== 1) throw new Error('stopped_during_generation_publish_window');
-  await writeActivity('activity-generation-two', 2);
+  await writeActivity('activity-generation-two', 2, refreshedRouteEvidenceFingerprint);
   await pause(500);
   if (await startCount() !== 1) throw new Error('duplicate_start_after_generation_rotation');
 
-  await waitUntil(async () => (await supervisorPhase()) === 'stopped', 'quiet_child_stop', 9_000);
-  await writeActivity('activity-after-quiet', 2);
+  await waitUntil(async () => (await supervisorPhase()) === 'stopped', 'quiet_child_stop', 14_000);
+  // Replaying the exact already-attempted generation/signature must not launch
+  // a second child after a transient lease loss. A new LAST signature below is
+  // what authorizes the next start.
+  await writeActivity('activity-generation-two', 2, refreshedRouteEvidenceFingerprint);
+  await pause(500);
+  if (await supervisorPhase() !== 'stopped' || await startCount() !== 1) throw new Error('restarted_same_activity_after_quiet');
+  await writeActivity('activity-after-quiet', 2, refreshedRouteEvidenceFingerprint);
   await waitUntil(async () => (await startCount()) === 2, 'second_fake_child_start');
 
   await writeJson(join(directory, 'last-target-status.json'), { schemaVersion: 1, status: 'held', reason: 'fixture_stop' });
