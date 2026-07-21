@@ -62,9 +62,31 @@ npm run listen:last:grpc
 On Windows, `run-grpc-last.cmd` is the equivalent long-running wrapper and
 writes the canonical observer logs used by the monitor.
 
+## Start the WSL observer and compiled Rust bridge
+
+For the Linux runtime, keep the two SSH forwards running, stop any Windows
+`grpc-last.mjs` and `last-route-to-notarb.mjs` instances, then run:
+
+```powershell
+wsl.exe -e bash /mnt/g/old-program/notarb/run-last-rust-pipeline.sh
+```
+
+The script starts the WSL Node Yellowstone reader in append-only `--no-state`
+mode and compiles/runs `rust/last-route-bridge` from the WSL cargo cache. The
+Rust process writes the lifecycle state and target markets, supports Orca
+Whirlpool (`whirLb...`, 653-byte pool state), and uses the same local
+`127.0.0.1:18899` read-RPC tunnel. Its logs are
+`last-grpc-rust-runtime.*.log` and `last-route-rust.*.log`.
+
 The observer records NotArb's no-profit checks as route-intent evidence. A
 `No arbitrage profit found` log means no settled trade price; it does not mean
 the mint, DEX, or ALT data is discarded.
+
+If a fresh check changes only ALT index selections or writable route-account
+metas while its validated markets stay the same, the Rust bridge preserves the
+generation and refreshes `last-target-route.json.automation.routeEvidenceFingerprint`
+before it publishes the active lease. That exact three-way fingerprint match is
+required by `last-notarb-supervisor.mjs` before it starts or keeps a child.
 
 ## Build the LAST-only NotArb markets file
 

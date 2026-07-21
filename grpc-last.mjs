@@ -46,8 +46,11 @@ const ENDPOINT = args.get('endpoint') ?? process.env.YELLOWSTONE_GRPC_ENDPOINT ?
 const X_TOKEN = process.env.YELLOWSTONE_X_TOKEN || undefined;
 const DURATION_SECONDS = boundedNumber(args.get('duration'), 0, 0, 86_400);
 const MAX_SEEN = boundedNumber(args.get('max-seen'), 20_000, 1_000, 200_000);
-const ROOT = resolve(process.cwd());
-const STATE_PATH = resolve(ROOT, '.last-grpc-state.json');
+const ROOT = resolve(args.get('root') ?? process.cwd());
+// The Rust route bridge can own the small lifecycle state in a Linux runtime.
+// In that mode this observer remains an append-only gRPC evidence producer and
+// skips the large Windows-replace state snapshot entirely.
+const STATE_PATH = args.has('no-state') ? null : resolve(ROOT, args.get('state') ?? '.last-grpc-state.json');
 const EVENTS_PATH = resolve(ROOT, 'last-grpc-events.jsonl');
 const ALT_USES_PATH = resolve(ROOT, 'last-grpc-alt-uses.jsonl');
 const SUMMARIES_PATH = resolve(ROOT, 'last-grpc-summaries.jsonl');
@@ -430,6 +433,7 @@ async function appendJsonLine(path, value) {
 }
 
 async function loadState() {
+  if (!STATE_PATH) return;
   try {
     const saved = JSON.parse(await readFile(STATE_PATH, 'utf8'));
     state = {
@@ -454,6 +458,7 @@ async function loadState() {
 }
 
 async function saveState() {
+  if (!STATE_PATH) return;
   const payload = {
     schemaVersion: 4,
     seen: [...state.seen],

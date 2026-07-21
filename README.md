@@ -157,6 +157,32 @@ The template is deliberately non-live:
 - no durable nonce pool exists;
 - WSOL unwrapper is off.
 
+## WSL Rust route bridge
+
+The production route bridge now has a Linux/WSL Rust implementation in
+`rust/last-route-bridge`. It reads the same local gRPC JSONL evidence, uses
+only `127.0.0.1:18899` for account/ALT validation, writes the target route
+lease, and supports Orca Whirlpool pool states (`653` bytes) in addition to
+the existing Pump, Meteora, and Raydium layouts.
+
+Run the Linux pipeline after stopping the legacy Windows observer and bridge:
+
+```powershell
+wsl.exe -e bash /mnt/g/old-program/notarb/run-last-rust-pipeline.sh
+```
+
+The WSL observer runs with `--no-state`; the compiled Rust bridge owns the
+small `.last-grpc-state.json` lease used by the existing lifecycle supervisor.
+This removes the former large Windows state-snapshot replacement path. Build
+artifacts live under the WSL home cache, outside the mounted worktree.
+
+When a fresh no-profit route check changes only its ALT indexes or writable
+account metas, the derived mint/DEX/pool/ALT set keeps its existing generation.
+Before publishing that renewed active lease, the Rust bridge atomically refreshes
+the route-evidence fingerprint in `last-target-route.json`. This keeps the
+observer, route record, and supervisor activity evidence coherent without
+starting a duplicate NotArb child.
+
 ## Activity-gated live sender and flash loan
 
 `notarb-last-grpc-live.example.toml` is the tracked LAST-only live profile.

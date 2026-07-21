@@ -97,7 +97,22 @@ async function readJsonIfPresent(path) {
 async function writeJsonAtomically(path, value) {
   const temporary = `${path}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await rename(temporary, path);
+  // Windows can briefly hold the destination open while a local watcher or
+  // antivirus scans the just-written state file. Keep the atomic replacement
+  // semantics and retry only those transient sharing violations; a later
+  // serial state transition remains ordered behind this one.
+  let delayMs = 20;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      await rename(temporary, path);
+      return;
+    } catch (error) {
+      const retryable = ['EPERM', 'EACCES', 'EBUSY'].includes(error?.code);
+      if (!retryable || attempt === 5) throw error;
+      await pause(delayMs);
+      delayMs = Math.min(delayMs * 2, 160);
+    }
+  }
 }
 
 function timestampAge(value) {

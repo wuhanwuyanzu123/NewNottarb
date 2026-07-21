@@ -12,6 +12,8 @@
 - `last-notarb-supervisor.mjs` owns the lifecycle for both the dry-run and live profiles: it starts one child only after current LAST route activity is bridge-validated, and stops that child after 30 seconds of quiet activity or on any held/stale/mismatched local evidence. The observer records dedicated `lastRoute*` activity fields so unrelated LAST transactions cannot start the child.
 - The direct target-runner wrapper is supervisor-internal and receives the same explicitly passed TOML that the supervisor validates; it rejects a direct launch rather than leaving a quiet-period bot running.
 - `notarb-last-grpc-live.example.toml`, `assert-last-live.mjs`, and the live wrappers provide a local ignored Jito-sender profile with one executor, an enabled SOL strategy, and `flash_loan = true`.
+- `rust/last-route-bridge` is a compiled WSL route bridge. It owns the compact route lease, validates the same target-only pools/ALTs through the local tunnel, and includes Orca Whirlpool's 653-byte pool layout. `run-last-rust-pipeline.sh` launches the WSL observer in append-only mode plus that Rust bridge.
+- When the validated market generation is unchanged but a new LAST route check has different ALT indexes or writable account metas, the Rust bridge refreshes the route-evidence fingerprint before publishing the renewed active lease. This keeps the observer, route record, and supervisor coherent without creating a duplicate generation.
 - `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
 
 ## Current topology
@@ -33,6 +35,16 @@
   -> SSH jump 82.23.138.51
   -> 127.0.0.1:18899
   -> NotArb loaders and token-account checker
+```
+
+The active Linux route path is:
+
+```text
+WSL Node gRPC observer (--no-state)
+  -> last-grpc-events.jsonl
+  -> compiled rust/last-route-bridge
+  -> .last-grpc-state.json + target markets/ALT/status
+  -> existing activity-gated live supervisor
 ```
 
 ## Evidence boundary

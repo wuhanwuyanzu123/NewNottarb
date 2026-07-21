@@ -33,6 +33,7 @@ const POOL_LAYOUTS = new Map([
   ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', { label: 'Pump.fun AMM', sizes: new Set([301]) }],
   ['cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG', { label: 'Meteora CPMM', sizes: new Set([1112]) }],
   ['LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', { label: 'Meteora DLMM', sizes: new Set([904]) }],
+  ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', { label: 'Orca Whirlpool', sizes: new Set([653]) }],
 ]);
 
 const args = parseArgs(process.argv.slice(2));

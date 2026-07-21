@@ -1,5 +1,6 @@
 # Dependencies and local runtime state
 node_modules/
+rust/**/target/
 *.log
 *.jsonl
 *.tmp
