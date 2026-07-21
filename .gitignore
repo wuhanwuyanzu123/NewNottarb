@@ -9,6 +9,7 @@ data/
 # Local evidence, debug files, and generated bot state
 .last-*.json
 last-*.json
+last-target-lookup-tables.txt
 *-debug.json
 
 # Never commit a local wallet or credential file. Keep package manifests tracked.

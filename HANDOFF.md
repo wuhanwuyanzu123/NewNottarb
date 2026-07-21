@@ -72,7 +72,8 @@ npm run extract:last:markets
 ```
 
 It reads only `last-grpc-events.jsonl`, validates candidate pool-state accounts
-through the local 82 read-RPC tunnel, and writes `last-target-markets.json`.
+through the local 82 read-RPC tunnel, and writes `last-target-markets.json`
+plus `last-target-lookup-tables.txt`.
 The current route is `5Uo...pump` against WSOL, using one Pump.fun AMM and two
 Meteora DLMM pool states. The global NotArb market scanner is not used.
 
@@ -95,6 +96,10 @@ Expected output includes the target static group:
 ```
 
 This proves LAST route extraction and NotArb market-file loading are connected.
+The template also loads `last-target-lookup-tables.txt`, which contains only
+the currently valid ALT IDs from the selected LAST route rather than an
+accumulated historical ALT list. Any observed ALT that is no longer readable
+is recorded as rejected in `last-target-route.json` and is not loaded.
 It does **not** send a transaction: the global scanner is disabled, every swap
 is disabled, no sender is configured, the executor has zero threads, and no
 nonce pool exists.

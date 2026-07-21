@@ -5,7 +5,7 @@
 - A standalone Yellowstone gRPC observer tracks `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through the 82 endpoint.
 - The observer keeps no-profit NotArb checks as arbitrage-intent evidence: mint, intended DEX programs, ALT tables, and a distinct `not_executed` price status.
 - The observed public ALT IDs are stored in `last-grpc-active-lookup-tables.txt`.
-- `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file`; it verifies DEX account owner and pool-state size through the 82 read-RPC tunnel before using an address.
+- `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file` and route-specific ALT file; it verifies DEX account owner/pool-state size and excludes unreadable ALT accounts through the 82 read-RPC tunnel before using an address.
 - The current target is `5UoWzex7rVky9ZSHGQXQgAPsm8jDZQMFBGqch8L7pump`. Its direct WSOL group consists of Pump.fun AMM `k1F3d5WQAtbrzkYtJuV7FJKcWuE72n3Rf4wWfGvy2kv` and Meteora DLMM `3MmyGFt8PLggposcCredKePikHYof34LQP6d5jBHcZua` / `4d8Vp7UdpkjG8aYKHPsnzjXSaxNhwHomrPD8Q612ixek`.
 - NotArb `onchain-bot` now loads only that target-specific `markets_file`; the global `[notarb_markets]` scan is disabled and no transaction is sent.
 
@@ -18,13 +18,27 @@
   -> grpc-last.mjs
   -> last-route-to-notarb.mjs
   -> last-target-markets.json
+  -> last-target-lookup-tables.txt
   -> NotArb [[markets_file]]
+  -> NotArb [[lookup_tables_file]]
 
 82.39.215.201:8899 Solana JSON-RPC (account/blockhash/ALT reads)
   -> SSH jump 82.23.138.51
   -> 127.0.0.1:18899
   -> NotArb read-only loaders
 ```
+
+## Evidence boundary
+
+- A `No arbitrage profit found` transaction is route-intent evidence only. It
+  can supply candidate mint/DEX/pool/ALT inputs for dry-run, but it is not an
+  executed DEX CPI and does not supply a realized price.
+- Always inspect `last-target-route.json.source.observedAt` before treating the
+  current group as fresh. The bridge deliberately keeps the last valid group
+  when no newer LAST route has arrived.
+- `observedLookupTables` records every ALT in the LAST transaction;
+  `selectedLookupTables` is the currently readable subset loaded by NotArb;
+  `rejectedLookupTables` is evidence only and is never loaded.
 
 ## Intentionally unfinished before live trading
 

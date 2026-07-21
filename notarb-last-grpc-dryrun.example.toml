@@ -32,7 +32,8 @@ threads = 0
 
 [[lookup_tables_file]]
 enabled = true
-path = "last-grpc-active-lookup-tables.txt"
+# Written by last-route-to-notarb.mjs from the selected LAST route only.
+path = "last-target-lookup-tables.txt"
 update_seconds = 30
 
 # Written by last-route-to-notarb.mjs from LAST gRPC evidence.
