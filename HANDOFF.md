@@ -1,8 +1,8 @@
 # Fresh-start handoff
 
-This guide is enough to reproduce the current **dry-run** system from a clean
-clone. It deliberately does not include a wallet, SSH private key, API key, or
-live trading authorization.
+This guide is enough to reproduce the current dry-run and activity-gated live
+profiles from a clean clone. It deliberately does not include a wallet or SSH
+private key.
 
 ## What you need outside this repository
 
@@ -149,18 +149,38 @@ for an unknown protocol and is safer than loading arbitrary accounts.
 The supervisor sees a validated route rotation as an in-place update while
 activity continues; it does not start a second NotArb child.
 
-## Before any live change
+## Start the activity-gated live sender / flash-loan profile
 
-Do not simply set `dry_run = false`. Complete every item in [PLAN.md](PLAN.md):
+The live profile remains LAST-only and is controlled by the same route lease as
+the dry run. Create the ignored local config, set its keypair path and
+token-account checker RPC, then validate and start the live supervisor. Use
+this profile instead of the dry-run supervisor, not alongside it.
 
-1. Use a dedicated funded wallet with an offline backup.
-2. Use an indexed Solana RPC for `[token_accounts_checker]`; the current 82
-   JSON-RPC node intentionally does not expose arbitrary-wallet token-account
-   secondary indexes.
-3. Agree explicit DEX allow-lists, fee/tip caps, cooldowns, and loss/spend
-   limits.
-4. Add a sender only after those decisions. Add durable nonces only if they
-   are newly created under the bot wallet's authority.
+```powershell
+Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml
+notepad .\notarb-last-grpc-live.toml
+node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
+npm run supervise:last:live
+```
+
+The profile has `transaction_executor.threads = 1`, one Jito Amsterdam sender,
+an enabled SOL strategy, and `[swap.strategy_defaults] flash_loan = true`.
+It keeps `[notarb_markets] enabled = false`, loading only the current
+`last-target-markets.json` and `last-target-lookup-tables.txt` written by the
+LAST bridge. The Jito UUID may remain empty; the profile keeps a 1,000 ms
+cooldown and caps priority fee and tip at 25,000 lamports.
+
+The live child starts only for a fresh bridge-validated LAST route and stops
+when the lease becomes quiet, held, stale, or incoherent. Its logs are
+`notarb-last-target-live.stdout.log` and
+`notarb-last-target-live.stderr.log`; supervisor logs are
+`last-notarb-live-supervisor.stdout.log` and
+`last-notarb-live-supervisor.stderr.log`.
+
+`[token_accounts_checker]` needs an RPC that can enumerate the bot wallet's
+token accounts. The 82 read-RPC tunnel remains appropriate for the bridge and
+standard loader reads; use a local forward to an indexed endpoint if the
+configured checker needs full token-account visibility.
 
 No private material should ever be committed. `.gitignore` excludes the local
 run config, wallet JSON files, event data, logs, and dependencies.

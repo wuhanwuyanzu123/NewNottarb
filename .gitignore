@@ -24,5 +24,6 @@ keys/
 
 # Local, runnable configurations may name a local keypair or endpoint.
 notarb-last-grpc-dryrun.toml
+notarb-last-grpc-live.toml
 notarb-circular-last-observe.toml
 circular-last-observe.toml

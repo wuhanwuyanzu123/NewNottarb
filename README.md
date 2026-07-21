@@ -4,9 +4,10 @@ This project follows the observed route of one address, not the whole chain:
 
 1. `grpc-last.mjs` watches `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through Yellowstone gRPC.
 2. `last-route-to-notarb.mjs` validates the DEX-owned pool-state accounts from those LAST transactions through the same 82 read-RPC tunnel and writes a NotArb `markets_file` plus a route-specific ALT file.
-3. `last-notarb-supervisor.mjs` starts the NotArb dry-run only during a fresh,
-   bridge-validated LAST activity window, and stops its own child tree when the
-   window closes. The global `[notarb_markets]` stream scanner is disabled.
+3. `last-notarb-supervisor.mjs` starts the selected target-only NotArb profile
+   only during a fresh, bridge-validated LAST activity window, and stops its
+   own child tree when the window closes. The global `[notarb_markets]` stream
+   scanner is disabled.
 
 No other project is used.
 
@@ -156,6 +157,33 @@ The template is deliberately non-live:
 - no durable nonce pool exists;
 - WSOL unwrapper is off.
 
+## Activity-gated live sender and flash loan
+
+`notarb-last-grpc-live.example.toml` is the tracked LAST-only live profile.
+Its local runnable copy is ignored by Git. It keeps the global scanner off and
+uses only the bridge-written `last-target-markets.json` plus its exact active
+ALT file. The profile enables one executor, one official Jito sender, an
+enabled SOL strategy, and `flash_loan = true`.
+
+```powershell
+Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml
+notepad .\notarb-last-grpc-live.toml # set the local bot keypair and token-account RPC
+node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
+npm run supervise:last:live
+```
+
+On Windows, `run-last-notarb-live-supervisor.cmd` is the long-running entry
+point. Keep the dry-run supervisor stopped when this profile is running. The
+live supervisor uses the same fresh route lease as the dry-run profile: quiet,
+held, stale, or incoherent LAST evidence leaves the Java child absent; a fresh
+bridge-validated route starts one `run-notarb-last-target-live.cmd` child.
+
+The Jito sender intentionally permits an empty UUID, matching NotArb's bundled
+base configuration. Tips and priority fees are capped at 25,000 lamports and
+the no-UUID cooldown is 1,000 ms. `token_accounts_checker` is configured
+separately because the live bot needs current token-account visibility for its
+own keypair.
+
 ## Runtime evidence
 
 Git intentionally ignores the high-frequency runtime evidence:
@@ -169,8 +197,8 @@ Git intentionally ignores the high-frequency runtime evidence:
 - `last-target-lookup-tables.txt` — the exact ALT set loaded with that target
   market group.
 
-See [PLAN.md](PLAN.md) before changing any safety control. For a clean-machine
-setup from `git clone` through a verified dry run, follow [HANDOFF.md](HANDOFF.md).
+For a clean-machine setup from `git clone` through the activity-gated profiles,
+follow [HANDOFF.md](HANDOFF.md).
 
 ## Historical diagnostics
 

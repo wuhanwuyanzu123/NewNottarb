@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * Lifecycle supervisor for the target-only LAST NotArb dry-run.
+ * Lifecycle supervisor for a target-only LAST NotArb configuration.
  *
  * The observer and route bridge stay resident.  This process starts the
- * target-only dry-run only after the bridge has published a fresh, validated
+ * target-only child only after the bridge has published a fresh, validated
  * LAST route, and stops only the child tree it started when that lease ends.
- * It reads local evidence/state files and starts the existing local dry-run
- * wrapper; it never changes the bot config, loads a keypair, signs, simulates,
- * or sends a transaction.
+ * It reads local evidence/state files and starts the caller-selected wrapper.
+ * It never changes the bot configuration; the configured runner determines
+ * whether the child is a dry-run or a live sender.
  */
 
 import { readFile, rename, writeFile } from 'node:fs/promises';
@@ -221,7 +221,7 @@ function saveSupervisorState(phase, details = {}) {
   return write;
 }
 
-async function assertDryRunConfig() {
+async function assertConfig() {
   const child = spawn(process.execPath, [ASSERT_PATH, CONFIG_PATH], {
     cwd: ROOT,
     windowsHide: true,
@@ -235,7 +235,7 @@ async function assertDryRunConfig() {
     child.once('error', rejectExit);
     child.once('close', resolveExit);
   });
-  if (code !== 0) throw new Error(`dry_run_config_invalid:${(stderr || stdout).trim() || `exit_${code}`}`);
+  if (code !== 0) throw new Error(`config_invalid:${(stderr || stdout).trim() || `exit_${code}`}`);
   return stdout.trim();
 }
 
@@ -400,7 +400,7 @@ async function startOwnedBot(eligibility) {
     announce('notarb_external_process_conflict', { pids: existing });
     return false;
   }
-  const assertResult = await assertDryRunConfig();
+  const assertResult = await assertConfig();
   // Passing the batch file as the /c command lets cmd.exe own the complete
   // wrapper tree.  The root PID is then safe to terminate with taskkill /T.
   const child = spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', RUNNER_PATH, CONFIG_PATH, '--managed-by-last-supervisor'], {

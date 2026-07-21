@@ -1,0 +1,74 @@
+# Copy to notarb-last-grpc-live.toml and set the dedicated funded bot keypair.
+# This configuration is target-only: the LAST bridge supplies its exact markets
+# and ALTs; the global scanner stays off. The default sender is the official
+# unauthenticated Jito endpoint so it can run without an API key or UUID.
+
+[notarb]
+acknowledge_terms_of_service = true
+
+[user]
+keypair_path = "REPLACE_WITH_DEDICATED_FUNDED_KEYPAIR.json"
+protect_keypair = false
+
+[blockhash_updater]
+rpc_url = "http://127.0.0.1:18899"
+delay_ms = 250
+
+[price_updater]
+rpc_url = "http://127.0.0.1:18899"
+
+[token_accounts_checker]
+# Keep this pointed at the local read-RPC tunnel.  A node with a full
+# token-account index gives the live bot complete owned-ATA visibility.
+rpc_url = "http://127.0.0.1:18899"
+delay_seconds = 3
+
+[market_loader]
+rpc_url = "http://127.0.0.1:18899"
+
+[lookup_table_loader]
+rpc_url = "http://127.0.0.1:18899"
+
+[transaction_executor]
+threads = 1
+
+[[lookup_tables_file]]
+enabled = true
+path = "last-target-lookup-tables.txt"
+update_seconds = 5
+
+[[markets_file]]
+enabled = true
+path = "last-target-markets.json"
+update_seconds = 5
+
+[wsol_unwrapper]
+enabled = false
+
+[notarb_markets]
+enabled = false
+dry_run = false
+grpc_url = "http://127.0.0.1:18100"
+
+[[sender]]
+id = "jito-ams"
+url = "https://amsterdam.mainnet.block-engine.jito.wtf"
+tip_type = "jito"
+uuid = ""
+
+[[swap]]
+enabled = true
+mint = "SOL"
+
+[swap.strategy_defaults]
+meteora_bin_limit = 16
+max_lookup_tables = 6
+flash_loan = true
+
+[[swap.strategy]]
+enabled = true
+cu_limit = 369100
+min_priority_fee_lamports = 1000
+max_priority_fee_lamports = 25000
+cooldown_ms = 1000
+senders = [{ id = "jito-ams", min_tip = 1000, max_tip = 25000, require_profit = true }]
