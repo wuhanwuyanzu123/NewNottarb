@@ -6,7 +6,8 @@
 - The observer keeps no-profit NotArb checks as arbitrage-intent evidence: mint, intended DEX programs, ALT tables, and a distinct `not_executed` price status.
 - The observed public ALT IDs are stored in `last-grpc-active-lookup-tables.txt`.
 - `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file` and route-specific ALT file; it verifies DEX account owner/pool-state size and excludes unreadable ALT accounts through the 82 read-RPC tunnel before using an address.
-- The current target is `5UoWzex7rVky9ZSHGQXQgAPsm8jDZQMFBGqch8L7pump`. Its direct WSOL group consists of Pump.fun AMM `k1F3d5WQAtbrzkYtJuV7FJKcWuE72n3Rf4wWfGvy2kv` and Meteora DLMM `3MmyGFt8PLggposcCredKePikHYof34LQP6d5jBHcZua` / `4d8Vp7UdpkjG8aYKHPsnzjXSaxNhwHomrPD8Q612ixek`.
+- The observer normalizes route fingerprints to suppress account-order noise while retaining writable route accounts, and the bridge switches generations only when the validated mint/DEX/pool/ALT set actually changes.
+- The active target is intentionally dynamic. Read `last-target-route.json` together with `last-target-status.json` rather than hard-coding a historical mint or pool group.
 - NotArb `onchain-bot` now loads only that target-specific `markets_file`; the global `[notarb_markets]` scan is disabled and no transaction is sent.
 
 ## Current topology
@@ -19,6 +20,7 @@
   -> last-route-to-notarb.mjs
   -> last-target-markets.json
   -> last-target-lookup-tables.txt
+  -> last-target-status.json (active/held)
   -> NotArb [[markets_file]]
   -> NotArb [[lookup_tables_file]]
 
@@ -39,6 +41,10 @@
 - `observedLookupTables` records every ALT in the LAST transaction;
   `selectedLookupTables` is the currently readable subset loaded by NotArb;
   `rejectedLookupTables` is evidence only and is never loaded.
+- `last-target-status.json` is the authoritative automatic-follow result. A
+  `held` result keeps the previous target group and reports unsupported DEX,
+  unreadable ALT, insufficient validated pools, or a stale observer; it never
+  replaces a known group with arbitrary account keys.
 
 ## Intentionally unfinished before live trading
 

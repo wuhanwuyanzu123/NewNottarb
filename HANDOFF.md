@@ -59,6 +59,9 @@ In a third PowerShell window:
 npm run listen:last:grpc
 ```
 
+On Windows, `run-grpc-last.cmd` is the equivalent long-running wrapper and
+writes the canonical observer logs used by the monitor.
+
 The observer records NotArb's no-profit checks as route-intent evidence. A
 `No arbitrage profit found` log means no settled trade price; it does not mean
 the mint, DEX, or ALT data is discarded.
@@ -71,11 +74,16 @@ In a fourth PowerShell window, keep the bridge running:
 npm run extract:last:markets
 ```
 
+Or use `run-last-route-to-notarb.cmd` on Windows to keep the same bridge in a
+background command process. It logs to `last-route-to-notarb.stdout.log` and
+`last-route-to-notarb.stderr.log`.
+
 It reads only `last-grpc-events.jsonl`, validates candidate pool-state accounts
 through the local 82 read-RPC tunnel, and writes `last-target-markets.json`
 plus `last-target-lookup-tables.txt`.
-The current route is `5Uo...pump` against WSOL, using one Pump.fun AMM and two
-Meteora DLMM pool states. The global NotArb market scanner is not used.
+Inspect the generated `last-target-route.json` and `last-target-status.json`
+for the current mint, pool group, ALT set, and whether it is active or held.
+The global NotArb market scanner is not used.
 
 ## Start target-specific NotArb in dry run
 
@@ -87,6 +95,9 @@ Copy-Item .\notarb-last-grpc-dryrun.example.toml .\notarb-last-grpc-dryrun.toml
 notepad .\notarb-last-grpc-dryrun.toml
 & "$env:LOCALAPPDATA\notarb\bin\notarb.bat" onchain-bot .\notarb-last-grpc-dryrun.toml
 ```
+
+For the local target-only instance, `run-notarb-last-target-dryrun.cmd` runs a
+preflight check of the no-send settings before starting the same command.
 
 Expected output includes the target static group:
 
@@ -103,6 +114,15 @@ is recorded as rejected in `last-target-route.json` and is not loaded.
 It does **not** send a transaction: the global scanner is disabled, every swap
 is disabled, no sender is configured, the executor has zero threads, and no
 nonce pool exists.
+
+## Automatic route changes
+
+No mint or pool is hard-coded in the bot config. The bridge switches to a new
+LAST route only after verifying a complete, supported pool group and every
+route ALT through the local read-RPC tunnel. It writes `last-target-status.json`
+with `active` or `held`; a held status preserves the previous group and names
+the reason (for example, unsupported DEX or unreadable ALT). This is expected
+for an unknown protocol and is safer than loading arbitrary accounts.
 
 ## Before any live change
 

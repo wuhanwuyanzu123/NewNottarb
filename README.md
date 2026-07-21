@@ -30,6 +30,9 @@ npm install
 npm run listen:last:grpc
 ```
 
+`run-grpc-last.cmd` is the equivalent long-running Windows wrapper; it writes
+the canonical `last-grpc.stdout.log` and `last-grpc.stderr.log` files.
+
 `No arbitrage profit found` is still useful arbitrage-intent evidence. It
 captures the target mint, intended DEX program(s), and ALT use; it has a
 `not_executed` price status rather than a fabricated realized fill price.
@@ -43,7 +46,7 @@ npm run extract:last:markets
 ```
 
 On Windows, `run-last-route-to-notarb.cmd` is the same read-only bridge in a
-long-running wrapper; it writes `last-route-to-notarb.active.*.log` and does
+long-running wrapper; it writes `last-route-to-notarb.*.log` and does
 not start NotArb or a transaction sender.
 
 It emits ignored runtime files:
@@ -55,20 +58,43 @@ It emits ignored runtime files:
 - `last-target-lookup-tables.txt` contains only the currently readable public
   ALT IDs from that selected LAST route, not an accumulated historical ALT
   list.
+- `last-target-status.json` records whether the newest LAST route is active or
+  safely held, plus the generation and reason. It is generated locally and
+  ignored by Git.
 
-For the currently observed route, the bridge selected target mint
+### Automatic route rotation
+
+There is no fixed target mint in the NotArb config. When LAST changes mint,
+validated pool set, DEX set, or ALT selection, the gRPC observer writes a new
+route snapshot. The bridge normalizes account ordering, validates the new
+pool-state accounts and ALT tables through `127.0.0.1:18899`, then atomically
+replaces each target file only when the complete route is usable. NotArb polls
+the market file every 15 seconds and the ALT file every 30 seconds.
+
+The bridge is deliberately fail-closed: an unsupported candidate DEX, an
+unreadable route ALT, or fewer than two validated pools leaves the prior target
+group in place and writes `status: "held"` with the reason instead of loading
+unverified accounts. Current automatic pool layouts cover Pump.fun AMM,
+Meteora DLMM/CPMM, and Raydium AMM v4. A newly observed protocol is surfaced
+in `unsupportedCandidateDexPrograms`; it must receive an explicit verified
+pool layout before it can be loaded.
+
+The runtime source of truth is always the ignored `last-target-route.json` and
+`last-target-status.json`, not the illustrative addresses below.
+
+One historical route example selected target mint
 `5UoWzex7rVky9ZSHGQXQgAPsm8jDZQMFBGqch8L7pump` with one direct WSOL group:
 
 - Pump.fun AMM: `k1F3d5WQAtbrzkYtJuV7FJKcWuE72n3Rf4wWfGvy2kv`
 - Meteora DLMM: `3MmyGFt8PLggposcCredKePikHYof34LQP6d5jBHcZua`
 - Meteora DLMM: `4d8Vp7UdpkjG8aYKHPsnzjXSaxNhwHomrPD8Q612ixek`
 
-The same selected route currently carries these three ALT IDs:
+That historical route carried these three ALT IDs:
 `GFcivC9XqVNS5pmEgZ8sgUL8b2JPbVyPYi5DzGBJPkZW`,
 `GrYRNa8tyCJ34t3Q9VzWwtc8YG7RSwcarYUt4mPyiDt5`, and
 `DshhssRRimFGxsQcWrfMr8yz9J6ux1zmxXrJqx6jmA5p`.
-The bridge checks each table through the local read-RPC before loading it:
-the first two are currently valid and go into
+The bridge checks each table through the local read-RPC before loading it. At
+the time this example was recorded, the first two were valid and went into
 `last-target-lookup-tables.txt`; `Dshh…` is retained as route evidence but is
 currently absent, so it is reported under `rejectedLookupTables` in
 `last-target-route.json` and is not sent to NotArb.
@@ -83,6 +109,11 @@ Copy-Item .\notarb-last-grpc-dryrun.example.toml .\notarb-last-grpc-dryrun.toml
 npm run extract:last:markets
 & "$env:LOCALAPPDATA\notarb\bin\notarb.bat" onchain-bot .\notarb-last-grpc-dryrun.toml
 ```
+
+`run-notarb-last-target-dryrun.cmd` is a Windows wrapper for that last command.
+It first checks the local config still has the target-only/no-send controls,
+then writes the canonical `notarb-last-target-dryrun.*.log` files used by the
+monitor.
 
 The template is deliberately non-live:
 

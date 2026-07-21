@@ -6,6 +6,7 @@
  * Read:   only the local 82 JSON-RPC tunnel for account owner/data lookup.
  * Output: last-target-markets.json (NotArb [[markets_file]] format)
  *         last-target-route.json   (human-readable route evidence)
+ *         last-target-status.json  (active/held auto-follow state)
  *
  * It never loads a keypair, signs, simulates, or sends a transaction.
  * The market file contains only pool-state accounts seen in a LAST route.
@@ -16,6 +17,7 @@
  */
 
 import { readFile, rename, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import process from 'node:process';
 
@@ -40,7 +42,11 @@ const EVENTS_PATH = resolve(ROOT, args.get('events') ?? 'last-grpc-events.jsonl'
 const MARKETS_PATH = resolve(ROOT, args.get('markets-out') ?? 'last-target-markets.json');
 const ROUTE_PATH = resolve(ROOT, args.get('route-out') ?? 'last-target-route.json');
 const LOOKUP_TABLES_PATH = resolve(ROOT, args.get('lookup-tables-out') ?? 'last-target-lookup-tables.txt');
+const STATUS_PATH = resolve(ROOT, args.get('status-out') ?? 'last-target-status.json');
+const BRIDGE_STATE_PATH = resolve(ROOT, args.get('state-out') ?? '.last-route-bridge-state.json');
+const OBSERVER_STATE_PATH = resolve(ROOT, args.get('observer-state') ?? '.last-grpc-state.json');
 const INTERVAL_MS = boundedNumber(args.get('interval'), 15_000, 5_000, 300_000);
+const MAX_OBSERVER_STALENESS_MS = boundedNumber(args.get('max-observer-staleness-seconds'), 120, 30, 3_600) * 1_000;
 const ONCE = args.has('once');
 const MAX_MARKETS_PER_GROUP = boundedNumber(args.get('max-markets'), 4, 2, 8);
 
@@ -109,10 +115,72 @@ async function loadLatestLastEvent() {
   const events = text.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
   for (const event of events.reverse()) {
     if (event.watch?.address !== WATCHED_ADDRESS) continue;
-    if (!event.notArb?.matched || !event.accountKeys?.length || !candidateMints(event).length) continue;
+    if (!event.success || !event.notArb?.matched || !event.accountKeys?.length || !candidateMints(event).length) continue;
     return event;
   }
   throw new Error(`No route evidence for ${WATCHED_ADDRESS} in ${EVENTS_PATH}`);
+}
+
+async function readJsonIfPresent(path) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function routeSource(event) {
+  return {
+    watchedAddress: WATCHED_ADDRESS,
+    signature: event.signature,
+    slot: event.slot,
+    observedAt: event.observedAt,
+  };
+}
+
+function fingerprint(value) {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function routeFingerprint(event) {
+  const sortIndexes = (indexes) => [...(indexes ?? [])].sort((left, right) => left - right);
+  const altSelections = (event.addressLookupTables ?? [])
+    .map((table) => ({
+      address: table.address,
+      writableIndexes: sortIndexes(table.writableIndexes),
+      readonlyIndexes: sortIndexes(table.readonlyIndexes),
+    }))
+    .sort((left, right) => left.address.localeCompare(right.address));
+  const writableRouteAccounts = (event.accountKeys ?? [])
+    .filter((key) => key.writable && !key.signer)
+    .map((key) => key.pubkey)
+    .sort();
+  return fingerprint({
+    mints: candidateMints(event).map((item) => item.mint).sort(),
+    candidateDexes: (event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [])
+      .map((item) => item.programId)
+      .sort(),
+    invokedDexes: (event.execution?.invokedPrograms ?? []).map((item) => item.programId).sort(),
+    executionKind: event.execution?.kind ?? null,
+    altSelections,
+    writableRouteAccounts,
+  });
+}
+
+function unsupportedCandidateDexes(event) {
+  return (event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [])
+    .filter((program) => !POOL_LAYOUTS.has(program.programId));
+}
+
+async function observerLiveness(fallbackObservedAt = null) {
+  const observer = await readJsonIfPresent(OBSERVER_STATE_PATH);
+  const lastObservedAt = observer?.lastObservedAt ?? fallbackObservedAt;
+  const ageMs = lastObservedAt ? Date.now() - Date.parse(lastObservedAt) : null;
+  return {
+    lastObservedAt,
+    stale: ageMs !== null && (!Number.isFinite(ageMs) || ageMs > MAX_OBSERVER_STALENESS_MS),
+  };
 }
 
 async function getAccounts(addresses) {
@@ -158,11 +226,13 @@ function marketGroups(targets, pools) {
     const candidates = pools.filter((pool) => pool.targetMints.includes(target.mint));
     const direct = candidates.filter((pool) => pool.containsWsol);
     const chosen = (direct.length >= 2 ? direct : candidates)
+      .sort((left, right) => left.address.localeCompare(right.address))
       .slice(0, MAX_MARKETS_PER_GROUP)
-      .map((pool) => pool.address);
+      .map((pool) => pool.address)
+      .sort();
     if (chosen.length >= 2) groups.push(chosen);
   }
-  return groups;
+  return groups.sort((left, right) => left.join(',').localeCompare(right.join(',')));
 }
 
 async function writeJsonAtomically(path, value) {
@@ -173,6 +243,28 @@ async function writeTextAtomically(path, value) {
   const temporary = `${path}.tmp`;
   await writeFile(temporary, value, 'utf8');
   await rename(temporary, path);
+}
+
+function activeFingerprint(event, groups, lookupTables) {
+  return fingerprint({
+    targetMints: candidateMints(event).map((item) => item.mint).sort(),
+    candidateDexes: (event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [])
+      .map((item) => item.programId)
+      .sort(),
+    groups,
+    lookupTables: [...lookupTables].sort(),
+  });
+}
+
+async function publishStatus(status) {
+  const previous = await readJsonIfPresent(STATUS_PATH);
+  if (previous?.fingerprint === status.fingerprint) return false;
+  await writeJsonAtomically(STATUS_PATH, {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    ...status,
+  });
+  return true;
 }
 
 function observedLookupTables(event) {
@@ -195,12 +287,13 @@ function validateLookupTables(accounts) {
   return { valid, rejected };
 }
 
-async function writeTargetLookupTables(event, tables) {
+async function writeTargetLookupTables(event, tables, generation) {
   const header = [
     '# Generated by last-route-to-notarb.mjs from one LAST gRPC route.',
     `# watched address: ${WATCHED_ADDRESS}`,
     `# source signature: ${event.signature}`,
     `# source observed at: ${event.observedAt}`,
+    `# target generation: ${generation}`,
     '# These are currently valid, route-specific public ALT accounts, not a send authorization.',
   ];
   if (!tables.length) header.push('# No observed ALT account is currently usable through the local 82 read-RPC tunnel.');
@@ -210,6 +303,37 @@ async function writeTargetLookupTables(event, tables) {
 
 async function build() {
   const event = await loadLatestLastEvent();
+  const source = routeSource(event);
+  const routeId = routeFingerprint(event);
+  const bridgeState = await readJsonIfPresent(BRIDGE_STATE_PATH);
+  const observer = await observerLiveness(event.observedAt);
+  const candidateDexPrograms = event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [];
+  const unsupportedDexPrograms = unsupportedCandidateDexes(event);
+  const hold = async (reason, details = {}) => {
+    const statusFingerprint = fingerprint({ status: 'held', reason, routeId, details });
+    const status = {
+      status: 'held',
+      reason,
+      fingerprint: statusFingerprint,
+      source,
+      observer,
+      activeTarget: bridgeState
+        ? { generation: bridgeState.generation, source: bridgeState.source }
+        : null,
+      ...details,
+    };
+    if (await publishStatus(status)) console.error(JSON.stringify({ status: 'target_route_held', reason, source, ...details }));
+  };
+
+  if (observer.stale) {
+    await hold('observer_stale', { maxObserverStalenessMs: MAX_OBSERVER_STALENESS_MS });
+    return;
+  }
+  if (unsupportedDexPrograms.length) {
+    await hold('unsupported_candidate_dex', { unsupportedCandidateDexPrograms: unsupportedDexPrograms });
+    return;
+  }
+
   const addresses = [...new Set(event.accountKeys.map((key) => key.pubkey))];
   const accounts = await getAccounts(addresses);
   const observedAlts = observedLookupTables(event);
@@ -218,8 +342,34 @@ async function build() {
   const targets = candidateMints(event);
   const pools = routePools(event, accounts);
   const groups = marketGroups(targets, pools);
-  if (!groups.length) throw new Error('No LAST candidate route has at least two validated pool-state accounts. Keeping the previous markets file.');
-  await writeTargetLookupTables(event, lookupTables);
+  if (rejectedLookupTables.length) {
+    await hold('unreadable_route_alt', { observedLookupTables: observedAlts, rejectedLookupTables });
+    return;
+  }
+  if (!groups.length) {
+    await hold('insufficient_validated_pools', {
+      validatedPoolCount: pools.length,
+      candidateDexPrograms,
+      observedLookupTables: observedAlts,
+    });
+    return;
+  }
+
+  const activeRouteFingerprint = activeFingerprint(event, groups, lookupTables);
+  if (bridgeState?.activeFingerprint === activeRouteFingerprint) {
+    await publishStatus({
+      status: 'active',
+      reason: 'unchanged',
+      fingerprint: activeRouteFingerprint,
+      generation: bridgeState.generation,
+      source: bridgeState.source,
+      observer,
+    });
+    return;
+  }
+
+  const generation = Number(bridgeState?.generation ?? 0) + 1;
+  await writeTargetLookupTables(event, lookupTables, generation);
   const generatedAt = new Date().toISOString();
   const route = {
     schemaVersion: 1,
@@ -233,19 +383,52 @@ async function build() {
     },
     baseMint: WSOL_MINT,
     targets: targets.map(({ bytes, ...target }) => target),
-    candidateDexPrograms: event.arbitrageIntent?.dexPrograms ?? event.candidates?.programs ?? [],
+    candidateDexPrograms,
+    unsupportedCandidateDexPrograms: unsupportedDexPrograms,
     observedLookupTables: observedAlts,
     selectedLookupTables: lookupTables,
     rejectedLookupTables,
     validatedPoolStates: pools,
     selectedGroups: groups,
+    automation: {
+      mode: 'auto_follow',
+      generation,
+      fingerprint: activeRouteFingerprint,
+      observerLastSeenAt: observer.lastObservedAt,
+      bridgeIntervalMs: INTERVAL_MS,
+    },
   };
-  await writeJsonAtomically(MARKETS_PATH, { update_timestamp: Date.now(), groups });
   await writeJsonAtomically(ROUTE_PATH, route);
-  console.log(JSON.stringify({
-    status: 'target_markets_written',
-    signature: event.signature,
+  // Commit the actual markets file last. The dry-run bot only acts on this
+  // file, so it cannot see a new pool group before the matching ALT evidence
+  // and human-readable route record have been written.
+  await writeJsonAtomically(MARKETS_PATH, { update_timestamp: Date.now(), groups });
+  await writeJsonAtomically(BRIDGE_STATE_PATH, {
+    schemaVersion: 1,
+    generation,
+    activeFingerprint: activeRouteFingerprint,
+    source,
+    updatedAt: generatedAt,
+  });
+  await publishStatus({
+    status: 'active',
+    reason: 'target_auto_follow',
+    fingerprint: activeRouteFingerprint,
+    generation,
+    source,
+    observer,
     targetMints: targets.map((target) => target.mint),
+    candidateDexPrograms,
+    lookupTables,
+    pools: pools.map((pool) => ({ address: pool.address, dex: pool.dex, containsWsol: pool.containsWsol })),
+    groups,
+  });
+  console.log(JSON.stringify({
+    status: 'target_route_switched',
+    generation,
+    signature: source.signature,
+    targetMints: targets.map((target) => target.mint),
+    candidateDexPrograms,
     observedLookupTables: observedAlts,
     lookupTables,
     rejectedLookupTables,

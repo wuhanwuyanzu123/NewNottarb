@@ -57,10 +57,11 @@ const STATE_SAVE_INTERVAL_MS = 5_000;
 
 let stream;
 let state = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   seen: new Set(),
   lastSlot: null,
   lastSignature: null,
+  lastObservedAt: null,
   activeRoute: null,
   knownAltTables: new Set(),
   window: newWindow(),
@@ -425,10 +426,11 @@ async function loadState() {
   try {
     const saved = JSON.parse(await readFile(STATE_PATH, 'utf8'));
     state = {
-      schemaVersion: 2,
+      schemaVersion: 3,
       seen: new Set(saved.seen ?? []),
       lastSlot: saved.lastSlot ?? null,
       lastSignature: saved.lastSignature ?? null,
+      lastObservedAt: saved.lastObservedAt ?? null,
       activeRoute: saved.activeRoute ?? null,
       knownAltTables: new Set(saved.knownAltTables ?? []),
       window: saved.window ?? newWindow(),
@@ -442,10 +444,11 @@ async function loadState() {
 
 async function saveState() {
   const payload = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     seen: [...state.seen],
     lastSlot: state.lastSlot,
     lastSignature: state.lastSignature,
+    lastObservedAt: state.lastObservedAt,
     activeRoute: state.activeRoute,
     knownAltTables: [...state.knownAltTables],
     window: state.window,
@@ -472,19 +475,31 @@ function markSeen(signature) {
 }
 
 function routeFingerprint(event) {
+  const sortIndexes = (indexes) => [...(indexes ?? [])].sort((left, right) => left - right);
+  const altSelections = (event.addressLookupTables ?? [])
+    .map((item) => ({
+      address: item.address,
+      writableIndexes: sortIndexes(item.writableIndexes),
+      readonlyIndexes: sortIndexes(item.readonlyIndexes),
+    }))
+    .sort((left, right) => left.address.localeCompare(right.address));
+  // Pool accounts can be static rather than ALT-loaded. Preserve their
+  // identity in the route fingerprint so a pool rotation produces a new
+  // target snapshot even when mint/DEX/ALT selections stay the same.
+  const writableRouteAccounts = (event.accountKeys ?? [])
+    .filter((key) => key.writable && !key.signer)
+    .map((key) => key.pubkey)
+    .sort();
   return JSON.stringify({
     mints: event.arbitrageIntent.mints.map((item) => item.mint).sort(),
     intendedDexes: event.arbitrageIntent.dexPrograms.map((item) => item.programId).sort(),
     invokedDexes: event.execution.invokedPrograms.map((item) => item.programId).sort(),
     executionKind: event.execution.kind,
-    // The same ALT can hold many pool accounts. Its selected index set is part
-    // of the route identity, so a LAST pool rotation produces fresh evidence
-    // for last-route-to-notarb.mjs instead of being hidden as a duplicate.
-    altSelections: event.addressLookupTables.map((item) => ({
-      address: item.address,
-      writableIndexes: item.writableIndexes,
-      readonlyIndexes: item.readonlyIndexes,
-    })),
+    // Normalizing table/index ordering avoids treating equivalent account
+    // metas as a changed route. The selected indexes and writable static keys
+    // still make a genuine pool rotation a new snapshot.
+    altSelections,
+    writableRouteAccounts,
   });
 }
 
@@ -549,6 +564,7 @@ async function persistEvent(event) {
   markSeen(event.signature);
   state.lastSlot = event.slot;
   state.lastSignature = event.signature;
+  state.lastObservedAt = event.observedAt;
   recordWindow(event);
   const summaryEmitted = await maybeEmitSummary(event);
   await maybeSaveState(notable || summaryEmitted);
