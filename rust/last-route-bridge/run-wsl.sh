@@ -7,6 +7,14 @@ set -euo pipefail
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${LAST_ROUTE_ROOT:-$(cd "$SOURCE_DIR/../.." && pwd)}"
+if [[ -n "${LAST_ROUTE_BRIDGE_BIN:-}" ]]; then
+  if [[ ! -x "$LAST_ROUTE_BRIDGE_BIN" ]]; then
+    echo '{"status":"rust_bridge_start_failed","reason":"packaged_binary_unavailable"}' >&2
+    exit 127
+  fi
+  exec "$LAST_ROUTE_BRIDGE_BIN" --root="$ROOT" "$@"
+fi
+
 SOURCE="$ROOT/rust/last-route-bridge"
 TARGET_DIR="${LAST_ROUTE_CARGO_TARGET_DIR:-$HOME/.cache/notarb-last-route-bridge-target}"
 CARGO_BIN="${CARGO_BIN:-}"

@@ -23,8 +23,8 @@
 
 ```text
 82.39.215.201:10000 Yellowstone gRPC
-  -> 82.23.138.51 /opt/notarb-last/grpc-last.mjs
-  -> /opt/notarb-last/last-grpc-events.jsonl
+  -> 82.23.138.51 /opt/notarb-last/current/grpc-last.mjs
+  -> /var/lib/notarb-last/runtime-state/last-grpc-events.jsonl
   -> compiled rust/last-route-bridge
   -> last-target-markets.json
   -> last-target-lookup-tables.txt

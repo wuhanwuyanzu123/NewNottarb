@@ -1,0 +1,274 @@
+name: Build and deploy LAST runtime
+
+on:
+  push:
+    branches:
+      - codex/last-activity-lifecycle
+    paths:
+      - '**/*.mjs'
+      - '**/*.sh'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'rust/last-route-bridge/**'
+      - 'deploy/systemd/**'
+      - '.gitattributes'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: notarb-last-production
+  cancel-in-progress: false
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build Linux release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out release
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Node dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Test Node runtime
+        run: |
+          set -euo pipefail
+          npm run test:last:supervisor
+          npm run test:last:bridge
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/last-route-bridge
+
+      - name: Test and build Rust bridge
+        run: |
+          set -euo pipefail
+          cargo test --locked --manifest-path rust/last-route-bridge/Cargo.toml
+          cargo build --release --locked --manifest-path rust/last-route-bridge/Cargo.toml
+
+      - name: Package runtime release
+        run: |
+          set -euo pipefail
+          release_dir=release
+          rm -rf "$release_dir" notarb-last-${GITHUB_SHA}.tar.gz
+          mkdir -p "$release_dir/bin" "$release_dir/deploy/systemd" "$release_dir/rust/last-route-bridge"
+
+          cp package.json package-lock.json "$release_dir/"
+          cp ./*.mjs "$release_dir/"
+          cp ./run-last-rust-pipeline.sh ./run-last-notarb-live-supervisor.sh ./run-notarb-last-target-live.sh "$release_dir/"
+          cp ./rust/last-route-bridge/run-wsl.sh "$release_dir/rust/last-route-bridge/run-wsl.sh"
+          cp ./deploy/systemd/notarb-last-pipeline.service ./deploy/systemd/notarb-last-live-supervisor.service "$release_dir/deploy/systemd/"
+          cp ./rust/last-route-bridge/target/release/last-route-bridge "$release_dir/bin/last-route-bridge"
+          cp -a node_modules "$release_dir/node_modules"
+
+          find "$release_dir" -type f \( -name '*.sh' -o -name '*.service' -o -name '*.mjs' -o -name '*.json' \) -exec sed -i 's/\r$//' {} +
+          chmod 0755 "$release_dir/bin/last-route-bridge" "$release_dir"/*.sh "$release_dir/rust/last-route-bridge/run-wsl.sh"
+          find "$release_dir" -type f -name '*.sh' -exec test -x {} \;
+          tar -C "$release_dir" -czf "notarb-last-${GITHUB_SHA}.tar.gz" .
+
+      - name: Upload immutable release
+        uses: actions/upload-artifact@v4
+        with:
+          name: notarb-last-${{ github.sha }}
+          path: notarb-last-${{ github.sha }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  deploy:
+    name: Deploy to 82
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Download release
+        uses: actions/download-artifact@v4
+        with:
+          name: notarb-last-${{ github.sha }}
+          path: artifact
+
+      - name: Configure pinned SSH access
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_SSH_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+
+      - name: Upload immutable release
+        run: |
+          set -euo pipefail
+          archive="notarb-last-${GITHUB_SHA}.tar.gz"
+          test -f "artifact/$archive"
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes root@82.23.138.51 'install -d -m 0755 /opt/notarb-last/incoming /opt/notarb-last/releases'
+          scp -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "artifact/$archive" "root@82.23.138.51:/opt/notarb-last/incoming/$archive"
+
+      - name: Activate and verify release
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes root@82.23.138.51 "GITHUB_SHA='$GITHUB_SHA' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          base=/opt/notarb-last
+          archive="$base/incoming/notarb-last-${GITHUB_SHA}.tar.gz"
+          releases="$base/releases"
+          release="$releases/$GITHUB_SHA"
+          staging="$releases/.${GITHUB_SHA}.staging"
+          runtime_state=/var/lib/notarb-last/runtime-state
+          config=/etc/notarb-last/notarb-last-grpc-live.toml
+          keypair=/etc/notarb-last/keypair.json
+          jar=/var/lib/notarb-last/notarb-1.1.2.jar
+          current="$base/current"
+          pipeline_unit=/etc/systemd/system/notarb-last-pipeline.service
+          supervisor_unit=/etc/systemd/system/notarb-last-live-supervisor.service
+          old_current=""
+          if [ -e "$current" ] && [ ! -L "$current" ]; then
+            echo "refusing to replace a non-symlink current release path: $current" >&2
+            exit 1
+          fi
+          if [ -L "$current" ]; then old_current="$(readlink -f "$current")"; fi
+          unit_backup="$(mktemp -d /root/notarb-last-units.XXXXXX)"
+          pipeline_had_unit=false
+          supervisor_had_unit=false
+          pipeline_was_active=false
+          supervisor_was_active=false
+          pipeline_was_enabled=false
+          supervisor_was_enabled=false
+          if [ -f "$pipeline_unit" ]; then
+            cp -a "$pipeline_unit" "$unit_backup/notarb-last-pipeline.service"
+            pipeline_had_unit=true
+            systemctl is-active --quiet notarb-last-pipeline.service && pipeline_was_active=true || true
+            systemctl is-enabled --quiet notarb-last-pipeline.service && pipeline_was_enabled=true || true
+          fi
+          if [ -f "$supervisor_unit" ]; then
+            cp -a "$supervisor_unit" "$unit_backup/notarb-last-live-supervisor.service"
+            supervisor_had_unit=true
+            systemctl is-active --quiet notarb-last-live-supervisor.service && supervisor_was_active=true || true
+            systemctl is-enabled --quiet notarb-last-live-supervisor.service && supervisor_was_enabled=true || true
+          fi
+
+          rollback() {
+            status="${1:-$?}"
+            trap - ERR
+            set +e
+            systemctl stop notarb-last-live-supervisor.service notarb-last-pipeline.service
+            if [ -n "$old_current" ] && [ -d "$old_current" ]; then
+              ln -sfn "$old_current" "$base/.current-rollback"
+              mv -Tf "$base/.current-rollback" "$current"
+            else
+              rm -f "$current"
+            fi
+            if [ "$pipeline_had_unit" = true ]; then
+              cp "$unit_backup/notarb-last-pipeline.service" "$pipeline_unit"
+            else
+              rm -f "$pipeline_unit"
+            fi
+            if [ "$supervisor_had_unit" = true ]; then
+              cp "$unit_backup/notarb-last-live-supervisor.service" "$supervisor_unit"
+            else
+              rm -f "$supervisor_unit"
+            fi
+            systemctl daemon-reload
+            if [ "$pipeline_had_unit" = true ] && [ "$pipeline_was_enabled" = true ]; then
+              systemctl enable notarb-last-pipeline.service
+            else
+              systemctl disable notarb-last-pipeline.service
+            fi
+            if [ "$supervisor_had_unit" = true ] && [ "$supervisor_was_enabled" = true ]; then
+              systemctl enable notarb-last-live-supervisor.service
+            else
+              systemctl disable notarb-last-live-supervisor.service
+            fi
+            if [ "$pipeline_was_active" = true ]; then systemctl start notarb-last-pipeline.service; fi
+            if [ "$supervisor_was_active" = true ]; then systemctl start notarb-last-live-supervisor.service; fi
+            rm -rf "$unit_backup"
+            exit "$status"
+          }
+
+          test -f "$archive"
+          test "$(/usr/bin/node -p 'process.versions.node.split(".")[0]')" = 22
+          /usr/bin/java -version 2>&1 | grep -q 'version "25\.'
+          test -f "$config" && test -f "$keypair"
+          test "$(stat -c %a "$config")" = 600
+          test "$(stat -c %a "$keypair")" = 600
+          test "$(stat -c %U:%G "$config")" = root:root
+          test "$(stat -c %U:%G "$keypair")" = root:root
+          install -d -m 0700 /var/lib/notarb-last
+          if [ ! -f "$jar" ]; then
+            test -f "$base/.notarb-1.1.2.jar"
+            install -m 0600 -o root -g root "$base/.notarb-1.1.2.jar" "$jar"
+          fi
+
+          rm -rf "$staging"
+          install -d -m 0755 "$staging"
+          install -d -m 0700 "$runtime_state"
+          tar -xzf "$archive" -C "$staging"
+          test -x "$staging/bin/last-route-bridge"
+          test -x "$staging/run-last-rust-pipeline.sh"
+          test -x "$staging/run-last-notarb-live-supervisor.sh"
+          test -x "$staging/rust/last-route-bridge/run-wsl.sh"
+          test -d "$staging/node_modules"
+          LAST_READ_RPC_URL=http://82.39.215.201:8899 /usr/bin/node "$staging/assert-last-live.mjs" "$config"
+
+          for name in .last-grpc-state.json .last-route-bridge-state.json .last-notarb-live-supervisor-state.json last-grpc-active-lookup-tables.txt last-grpc-alt-uses.jsonl last-grpc-events.jsonl last-grpc-rust-runtime.stderr.log last-grpc-rust-runtime.stdout.log last-grpc-summaries.jsonl last-notarb-live-supervisor.stderr.log last-notarb-live-supervisor.stdout.log last-route-rust.stderr.log last-route-rust.stdout.log last-target-lookup-tables.txt last-target-markets.json last-target-route.json last-target-status.json notarb-last-target-live.stderr.log notarb-last-target-live.stdout.log; do
+            if [ ! -e "$runtime_state/$name" ] && [ -e "$base/$name" ]; then cp -a "$base/$name" "$runtime_state/$name"; fi
+            ln -sfn "$runtime_state/$name" "$staging/$name"
+          done
+          if [ -e "$release" ]; then
+            rm -rf "$staging"
+          else
+            mv "$staging" "$release"
+          fi
+
+          trap 'rollback $?' ERR
+          if [ "$supervisor_had_unit" = true ]; then systemctl stop notarb-last-live-supervisor.service; fi
+          if [ "$pipeline_had_unit" = true ]; then systemctl stop notarb-last-pipeline.service; fi
+          ln -sfn "$release" "$base/.current-new"
+          mv -Tf "$base/.current-new" "$current"
+          if [ -n "$old_current" ]; then
+            ln -sfn "$old_current" "$base/previous"
+          fi
+          install -m 0644 "$release/deploy/systemd/notarb-last-pipeline.service" "$pipeline_unit"
+          install -m 0644 "$release/deploy/systemd/notarb-last-live-supervisor.service" "$supervisor_unit"
+          systemctl daemon-reload
+          systemd-analyze verify "$pipeline_unit" "$supervisor_unit"
+          systemctl enable notarb-last-pipeline.service notarb-last-live-supervisor.service
+          systemctl start notarb-last-pipeline.service notarb-last-live-supervisor.service
+          pipeline_restarts="$(systemctl show -p NRestarts --value notarb-last-pipeline.service)"
+          supervisor_restarts="$(systemctl show -p NRestarts --value notarb-last-live-supervisor.service)"
+
+          for attempt in $(seq 1 12); do
+            if [ "$(systemctl is-active notarb-last-pipeline.service)" = active ] && [ "$(systemctl is-active notarb-last-live-supervisor.service)" = active ] && [ "$(systemctl show -p NRestarts --value notarb-last-pipeline.service)" = "$pipeline_restarts" ] && [ "$(systemctl show -p NRestarts --value notarb-last-live-supervisor.service)" = "$supervisor_restarts" ]; then
+              touch "$runtime_state/.deploy-healthcheck"
+              rm -rf "$unit_backup"
+              rm -f "$archive"
+              trap - ERR
+              exit 0
+            fi
+            sleep 5
+          done
+          echo 'deployment health check failed' >&2
+          rollback 1
+          REMOTE

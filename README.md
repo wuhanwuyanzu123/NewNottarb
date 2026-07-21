@@ -9,9 +9,10 @@ This project follows the observed route of one address, not the whole chain:
    own child tree when the window closes. The global `[notarb_markets]` stream
    scanner is disabled.
 
-No other project is used. The intended server runtime is `82.23.138.51`; its
-systemd units are tracked as deployment templates and are currently stopped.
-The Windows/WSL commands below are retained only for local development.
+No other project is used. The intended server runtime is `82.23.138.51`.
+GitHub Actions builds the Linux release, uploads it to the server, and switches
+`/opt/notarb-last/current` only after configuration validation. The Windows/WSL
+commands below are retained only for local development.
 
 ## 82.23 deployment topology
 
@@ -20,8 +21,8 @@ services without a local SSH forward:
 
 ```text
 82.39.215.201:10000 Yellowstone gRPC
-  -> 82.23.138.51 /opt/notarb-last/grpc-last.mjs
-  -> /opt/notarb-last/last-grpc-events.jsonl
+  -> 82.23.138.51 /opt/notarb-last/current/grpc-last.mjs
+  -> /var/lib/notarb-last/runtime-state/last-grpc-events.jsonl
   -> compiled Rust bridge
   -> target route / markets / ALT / status files
   -> activity-gated NotArb supervisor
@@ -195,8 +196,9 @@ wsl.exe -e bash /mnt/g/old-program/notarb/run-last-rust-pipeline.sh
 
 The observer runs with `--no-state`; the compiled Rust bridge owns the small
 `.last-grpc-state.json` lease used by the lifecycle supervisor. In the 82.23
-deployment, the service uses `/var/lib/notarb-last/rust-target` for compiled
-artifacts and `/opt/notarb-last` for runtime evidence.
+deployment, GitHub Actions supplies the compiled bridge at
+`/opt/notarb-last/current/bin/last-route-bridge`, while generated evidence is
+kept under `/var/lib/notarb-last/runtime-state` and linked into the release.
 
 Before the first qualified event, or when the stream contains no qualifying
 route evidence, the bridge publishes `status: "held"` with

@@ -6,15 +6,15 @@ After=network-online.target notarb-last-pipeline.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/notarb-last
+WorkingDirectory=/opt/notarb-last/current
 UMask=0077
 Environment=NODE_BIN=/usr/bin/node
 Environment=LAST_LIVE_CONFIG=/etc/notarb-last/notarb-last-grpc-live.toml
 Environment=LAST_READ_RPC_URL=http://82.39.215.201:8899
 Environment=NOTARB_JAVA_BIN=/usr/bin/java
-Environment=NOTARB_JAR=/opt/notarb-last/.notarb-1.1.2.jar
+Environment=NOTARB_JAR=/var/lib/notarb-last/notarb-1.1.2.jar
 Environment=NOTARB_HOME=/var/lib/notarb-last
-ExecStart=/usr/bin/bash /opt/notarb-last/run-last-notarb-live-supervisor.sh
+ExecStart=/usr/bin/bash /opt/notarb-last/current/run-last-notarb-live-supervisor.sh
 Restart=always
 RestartSec=3
 TimeoutStopSec=20

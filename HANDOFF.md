@@ -6,10 +6,12 @@ private key.
 
 ## 82.23.138.51 deployment target
 
-The server layout and systemd templates are prepared for
-`root@82.23.138.51`, not the Windows workstation. The services are currently
-stopped and their installed unit files have been removed; use the clean
-deployment steps below when deployment is explicitly resumed:
+The production target is `root@82.23.138.51`, not the Windows workstation.
+GitHub Actions builds an immutable Linux release and atomically switches the
+server's `current` release link. The deployment job validates the private
+configuration before stopping services, keeps generated runtime evidence
+outside a release, waits for both services to remain healthy, and restores the
+prior release, units, and enabled/active state if activation fails.
 
 ```bash
 systemctl status notarb-last-pipeline.service
@@ -23,11 +25,14 @@ NotArb Java child only for a fresh, bridge-validated `active` LAST lease.
 absent. The current server paths are:
 
 ```text
-/opt/notarb-last                 runtime source, JAR, and generated evidence
+/opt/notarb-last/current         symlink to the active immutable release
+/opt/notarb-last/releases/<sha>  immutable release directories
+/opt/notarb-last/incoming        uploaded release archives
 /etc/notarb-last                 0700 private config directory
 /etc/notarb-last/keypair.json    0600 bot keypair
 /etc/notarb-last/notarb-last-grpc-live.toml  0600 live config
-/var/lib/notarb-last/rust-target compiled Rust target directory
+/var/lib/notarb-last             0700 runtime state and NotArb JAR
+/var/lib/notarb-last/runtime-state  generated observer/bridge/supervisor state
 ```
 
 When deployed, the server connects directly to `82.39.215.201:10000` (gRPC) and
@@ -35,39 +40,46 @@ When deployed, the server connects directly to `82.39.215.201:10000` (gRPC) and
 Helius sending endpoint. There are no Windows/WSL observer processes or local
 SSH tunnels in this deployment.
 
-## Deploy from a clean clone to a new 82.23 host
+## CI/CD deployment to 82.23
 
-1. Install Node 22+, Java 25, and Rust/Cargo 1.75+ on the server. Create the
-   paths above, with `/etc/notarb-last` mode `0700` and its private files mode
-   `0600`.
-2. Copy this repository to `/opt/notarb-last`, run `npm ci --ignore-scripts`,
-   and copy the matching NotArb JAR to `/opt/notarb-last/.notarb-1.1.2.jar`.
-   Keep runtime source root-owned and remove group/other write permission.
-3. Create `/etc/notarb-last/notarb-last-grpc-live.toml` from the tracked
-   example, set the bot keypair and Helius API key, and change every loader
-   read RPC plus `grpc_url` to the direct 82.39 endpoints. Do not commit this
-   file or the keypair.
-4. Install `deploy/systemd/notarb-last-pipeline.service` and
-   `deploy/systemd/notarb-last-live-supervisor.service` under
-   `/etc/systemd/system/`, then run:
+1. Install `/usr/bin/node` major version 22 and `/usr/bin/java` major version
+   25 on the server. Rust and Cargo are not needed on the server: the workflow
+   ships a compiled Linux bridge.
+2. Create `/etc/notarb-last` with mode `0700`, then create
+   `/etc/notarb-last/keypair.json` and
+   `/etc/notarb-last/notarb-last-grpc-live.toml` as `root:root`, mode `0600`.
+   Start the live TOML from the tracked example, set the bot keypair and
+   Helius API key, and change every loader read RPC plus `grpc_url` to the
+   direct 82.39 endpoints. Do not commit this file or the keypair.
+3. For the first deployment only, place the matching NotArb JAR at
+   `/opt/notarb-last/.notarb-1.1.2.jar`. The workflow verifies it and installs
+   the private runtime copy under `/var/lib/notarb-last/`.
+4. In GitHub, create the `production` environment and add these environment
+   secrets:
 
-   ```bash
-   systemctl daemon-reload
-   systemctl enable --now notarb-last-pipeline.service
-   systemctl enable --now notarb-last-live-supervisor.service
-   ```
+   - `DEPLOY_SSH_KEY`: a dedicated private key authorized for
+     `root@82.23.138.51`.
+   - `DEPLOY_KNOWN_HOSTS`: the pinned OpenSSH `known_hosts` entry for
+     `82.23.138.51`.
 
-5. Verify the config without printing its secret URL, then inspect the two
+5. Push a change to `codex/last-activity-lifecycle` that matches the workflow
+   path filters, or invoke **Build and deploy LAST runtime** manually from the
+   Actions tab. The `production` job uploads, activates, and checks the
+   release.
+6. Verify the config without printing its secret URL, then inspect the two
    service states and logs:
 
    ```bash
    LAST_READ_RPC_URL=http://82.39.215.201:8899 \
-     node /opt/notarb-last/assert-last-live.mjs \
+     /usr/bin/node /opt/notarb-last/current/assert-last-live.mjs \
        /etc/notarb-last/notarb-last-grpc-live.toml
    systemctl --no-pager --full status notarb-last-pipeline.service notarb-last-live-supervisor.service
-   tail -n 50 /opt/notarb-last/last-route-rust.stderr.log
-   tail -n 50 /opt/notarb-last/last-notarb-live-supervisor.stdout.log
+   tail -n 50 /opt/notarb-last/current/last-route-rust.stderr.log
+   tail -n 50 /opt/notarb-last/current/last-notarb-live-supervisor.stdout.log
    ```
+
+The initial migration accepts the older direct `/opt/notarb-last` layout as a
+rollback source. It does not replace an existing non-symlink `current` path.
 
 Before enabling this server on a migration, stop every prior live supervisor
 and its child tree elsewhere so two runtimes never send at the same time.
