@@ -10,6 +10,7 @@ import process from 'node:process';
 import { promisify } from 'node:util';
 
 const ROOT = resolve(process.cwd());
+const IS_WINDOWS = process.platform === 'win32';
 const SUPERVISOR = resolve(ROOT, 'last-notarb-supervisor.mjs');
 const ASSERT = resolve(ROOT, 'assert-last-dryrun.mjs');
 const directory = await mkdtemp(join(tmpdir(), 'last-notarb-supervisor-'));
@@ -124,10 +125,18 @@ async function pause(milliseconds) {
 async function stopSupervisor(child) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   const closed = new Promise((resolveClose) => child.once('close', resolveClose));
-  try {
-    await execFileAsync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
-  } catch {
-    // The child can exit naturally between the phase check and taskkill.
+  if (IS_WINDOWS) {
+    try {
+      await execFileAsync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true });
+    } catch {
+      // The child can exit naturally between the phase check and taskkill.
+    }
+  } else {
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // The child can exit naturally between the phase check and signal.
+    }
   }
   await Promise.race([closed, pause(5_000)]);
 }
@@ -178,24 +187,50 @@ const path = process.argv[2];
 await appendFile(path, 'started\\n');
 setInterval(() => undefined, 1000);
 `, 'utf8');
-  await writeFile(join(directory, 'run-fake.cmd'), `@echo off\r\necho %~1>"%~dp0runner-config.log"\r\necho %~2>"%~dp0runner-supervisor.log"\r\nnode.exe "%~dp0fake-child.mjs" "%~dp0fake-child-events.log" 1>>"%~dp0fake-child.stdout.log" 2>>"%~dp0fake-child.stderr.log"\r\n`, 'utf8');
-  await writeRoute(1, routeEvidenceFingerprint, 'fixture-route-source');
-  await writeActivity('activity-before-start');
-  await writeJson(join(directory, 'last-target-status.json'), { schemaVersion: 1, status: 'held', reason: 'fixture_initial_hold' });
+  const runnerPath = join(directory, IS_WINDOWS ? 'run-fake.cmd' : 'run-fake.sh');
+  if (IS_WINDOWS) {
+    await writeFile(runnerPath, `@echo off\r\necho %~1>"%~dp0runner-config.log"\r\necho %~2>"%~dp0runner-supervisor.log"\r\nnode.exe "%~dp0fake-child.mjs" "%~dp0fake-child-events.log" 1>>"%~dp0fake-child.stdout.log" 2>>"%~dp0fake-child.stderr.log"\r\n`, 'utf8');
+  } else {
+    await writeFile(runnerPath, `#!/usr/bin/env bash
+set -euo pipefail
+RUNNER_DIR="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\\n' "$1" >"$RUNNER_DIR/runner-config.log"
+printf '%s\\n' "$2" >"$RUNNER_DIR/runner-supervisor.log"
+"${process.execPath}" "$RUNNER_DIR/fake-child.mjs" "$RUNNER_DIR/fake-child-events.log" 1>>"$RUNNER_DIR/fake-child.stdout.log" 2>>"$RUNNER_DIR/fake-child.stderr.log"
+STATUS=$?
+exit "$STATUS"
+`, 'utf8');
+  }
+  // A quiet bridge can publish only its status file; it does not need route,
+  // observer, or markets evidence until it has an active route.  Starting the
+  // supervisor in that state must report route_not_active rather than an
+  // evidence_unreadable error.
+  await writeJson(join(directory, 'last-target-status.json'), {
+    schemaVersion: 1,
+    status: 'no_route_evidence',
+    reason: 'fixture_initial_quiet',
+  });
 
   supervisor = spawn(process.execPath, [
     SUPERVISOR,
     `--root=${directory}`,
     `--assert=${ASSERT}`,
-    `--runner=${join(directory, 'run-fake.cmd')}`,
+    `--runner=${runnerPath}`,
     '--poll-ms=100',
     '--idle-seconds=10',
   ], { cwd: directory, windowsHide: true, stdio: 'pipe' });
   supervisor.stdout.on('data', (chunk) => { supervisorStdout += chunk; });
   supervisor.stderr.on('data', (chunk) => { supervisorStderr += chunk; });
 
-  await pause(500);
-  if (await startCount() !== 0) throw new Error('started_while_initial_status_was_held');
+  await waitUntil(() => supervisorStdout.includes('"reason":"route_not_active"'), 'initial_quiet_status_gate');
+  if (await startCount() !== 0) throw new Error('started_while_initial_status_was_quiet');
+  if (supervisorStdout.includes('evidence_unreadable')) throw new Error('quiet_status_required_missing_evidence');
+  // Conversely, an active lease without its supporting evidence must remain
+  // ineligible. This preserves the strict active-path validation.
+  await writeActiveStatus(activityRecord('activity-missing-evidence', 1, routeEvidenceFingerprint));
+  await waitUntil(() => supervisorStdout.includes('"reason":"evidence_unreadable"'), 'active_missing_evidence_gate');
+  if (await startCount() !== 0) throw new Error('started_with_active_missing_evidence');
+  await writeRoute(1, routeEvidenceFingerprint, 'fixture-route-source');
   await writeActivity('activity-one');
   await waitUntil(async () => (await startCount()) === 1, 'first_fake_child_start');
   if (await fixtureLog('runner-config.log') !== join(directory, 'notarb-last-grpc-dryrun.toml')) throw new Error('runner_received_different_config_than_supervisor_validated');
@@ -204,8 +239,7 @@ setInterval(() => undefined, 1000);
   // WSL clock. A freshly written local file with an intentionally old payload
   // must stay live; the supervisor gates on the host mtime.
   await writeMarketsHeartbeat(60_000);
-  await pause(300);
-  if (await supervisorPhase() !== 'running' || await startCount() !== 1) throw new Error('treated_payload_timestamp_as_host_heartbeat');
+  await waitUntil(async () => (await supervisorPhase()) === 'running' && (await startCount()) === 1, 'host_mtime_heartbeat_keeps_running');
   // A five-second bridge cadence plus the modeled eight-second WSL clock skew
   // must remain a live lease under the default 20-second heartbeat tolerance.
   await pause(5_500);

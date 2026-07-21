@@ -3,28 +3,46 @@
 This project follows the observed route of one address, not the whole chain:
 
 1. `grpc-last.mjs` watches `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through Yellowstone gRPC.
-2. `last-route-to-notarb.mjs` validates the DEX-owned pool-state accounts from those LAST transactions through the same 82 read-RPC tunnel and writes a NotArb `markets_file` plus a route-specific ALT file.
+2. The compiled `rust/last-route-bridge` validates DEX-owned pool-state accounts from those LAST transactions through the read RPC and writes a NotArb `markets_file` plus a route-specific ALT file.
 3. `last-notarb-supervisor.mjs` starts the selected target-only NotArb profile
    only during a fresh, bridge-validated LAST activity window, and stops its
    own child tree when the window closes. The global `[notarb_markets]` stream
    scanner is disabled.
 
-No other project is used.
+No other project is used. The intended server runtime is `82.23.138.51`; its
+systemd units are tracked as deployment templates and are currently stopped.
+The Windows/WSL commands below are retained only for local development.
 
-## 82 network topology
+## 82.23 deployment topology
 
-The 82 host is reached through `82.23.138.51` with two local SSH forwards:
+`82.23.138.51` runs both systemd services directly. It reaches the upstream
+services without a local SSH forward:
 
-```powershell
-# Yellowstone LAST observer
-ssh -i C:\Users\test\.ssh\id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -N -L 127.0.0.1:18100:82.39.215.201:10000 root@82.23.138.51
+```text
+82.39.215.201:10000 Yellowstone gRPC
+  -> 82.23.138.51 /opt/notarb-last/grpc-last.mjs
+  -> /opt/notarb-last/last-grpc-events.jsonl
+  -> compiled Rust bridge
+  -> target route / markets / ALT / status files
+  -> activity-gated NotArb supervisor
 
-# Required read-only Solana RPC for account and ALT reads
-ssh -i C:\Users\test\.ssh\id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -N -L 127.0.0.1:18899:82.39.215.201:8899 root@82.23.138.51
+82.39.215.201:8899 read RPC
+  -> Rust pool/ALT validation and NotArb loader reads
+
+Helius ordinary JSON-RPC
+  -> the single configured live `spam1` sender
 ```
 
-`18100` is the only market-discovery source. `18899` is a required read RPC;
-it is not a transaction sender.
+The deployment templates create `notarb-last-pipeline.service` and
+`notarb-last-live-supervisor.service`. After an explicit deployment, check
+them from an authorized machine:
+
+```powershell
+ssh root@82.23.138.51 "systemctl --no-pager status notarb-last-pipeline.service notarb-last-live-supervisor.service"
+```
+
+The two local ports `127.0.0.1:18100` and `127.0.0.1:18899` are not part of
+the deployed runtime. They remain an optional local-development topology only.
 
 ## LAST observer
 
@@ -41,6 +59,9 @@ captures the target mint, intended DEX program(s), and ALT use; it has a
 `not_executed` price status rather than a fabricated realized fill price.
 
 ## LAST route to NotArb markets bridge
+
+This Node bridge is retained for local-development troubleshooting. The 82.23
+deployment uses the Rust bridge described below.
 
 Run this alongside the observer:
 
@@ -157,24 +178,30 @@ The template is deliberately non-live:
 - no durable nonce pool exists;
 - WSOL unwrapper is off.
 
-## WSL Rust route bridge
+## Linux Rust route bridge
 
-The production route bridge now has a Linux/WSL Rust implementation in
-`rust/last-route-bridge`. It reads the same local gRPC JSONL evidence, uses
-only `127.0.0.1:18899` for account/ALT validation, writes the target route
-lease, and supports Orca Whirlpool pool states (`653` bytes) in addition to
-the existing Pump, Meteora, and Raydium layouts.
+The production route bridge is Linux-compatible and runs in the 82.23 pipeline.
+It reads the local gRPC JSONL evidence, uses `LAST_READ_RPC_URL` for account
+and ALT validation, writes the target route lease, and supports Orca Whirlpool
+pool states (`653` bytes) in addition to the existing Pump, Meteora, and
+Raydium layouts. The deployed value is `http://82.39.215.201:8899`.
 
-Run the Linux pipeline after stopping the legacy Windows observer and bridge:
+For local WSL development, run the Linux pipeline only after stopping any
+legacy Windows observer and bridge:
 
 ```powershell
 wsl.exe -e bash /mnt/g/old-program/notarb/run-last-rust-pipeline.sh
 ```
 
-The WSL observer runs with `--no-state`; the compiled Rust bridge owns the
-small `.last-grpc-state.json` lease used by the existing lifecycle supervisor.
-This removes the former large Windows state-snapshot replacement path. Build
-artifacts live under the WSL home cache, outside the mounted worktree.
+The observer runs with `--no-state`; the compiled Rust bridge owns the small
+`.last-grpc-state.json` lease used by the lifecycle supervisor. In the 82.23
+deployment, the service uses `/var/lib/notarb-last/rust-target` for compiled
+artifacts and `/opt/notarb-last` for runtime evidence.
+
+Before the first qualified event, or when the stream contains no qualifying
+route evidence, the bridge publishes `status: "held"` with
+`reason: "no_route_evidence"`. That is a normal quiet state: it performs no
+read-RPC lookup and creates no active route, markets, or ALT output.
 
 When a fresh no-profit route check changes only its ALT indexes or writable
 account metas, the derived mint/DEX/pool/ALT set keeps its existing generation.
@@ -183,9 +210,8 @@ the route-evidence fingerprint in `last-target-route.json`. This keeps the
 observer, route record, and supervisor activity evidence coherent without
 starting a duplicate NotArb child.
 
-The lifecycle supervisor uses the local Windows mtimes of the bridge-written
-status and markets files for lease freshness, rather than comparing WSL payload
-timestamps to the Windows clock. Its markets heartbeat default is 20 seconds;
+The lifecycle supervisor uses the host mtimes of the bridge-written status and
+markets files for lease freshness. Its markets heartbeat default is 20 seconds;
 a `held` or stale route status still stops the child immediately.
 If a heartbeat gap stops a child, the supervisor records that activity key and
 will not start it again for the same generation/signature. Only a new validated
@@ -196,27 +222,28 @@ LAST activity key may launch the next child.
 `notarb-last-grpc-live.example.toml` is the tracked LAST-only live profile.
 Its local runnable copy is ignored by Git. It keeps the global scanner off and
 uses only the bridge-written `last-target-markets.json` plus its exact active
-ALT file. The profile enables one executor, one official Jito sender, an
-enabled SOL strategy, and `flash_loan = true`.
+ALT file. The profile enables one executor, one ordinary Helius JSON-RPC
+sender (`[[spam_rpc]]`), an enabled SOL strategy, and `flash_loan = true`.
 
 ```powershell
 Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml
-notepad .\notarb-last-grpc-live.toml # set the local bot keypair and token-account RPC
+notepad .\notarb-last-grpc-live.toml # set the local bot keypair and Helius sending URL
 node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
 npm run supervise:last:live
 ```
 
-On Windows, `run-last-notarb-live-supervisor.cmd` is the long-running entry
-point. Keep the dry-run supervisor stopped when this profile is running. The
-live supervisor uses the same fresh route lease as the dry-run profile: quiet,
-held, stale, or incoherent LAST evidence leaves the Java child absent; a fresh
-bridge-validated route starts one `run-notarb-last-target-live.cmd` child.
+On 82.23, `notarb-last-live-supervisor.service` runs
+`run-last-notarb-live-supervisor.sh`; it uses the same fresh route lease as the
+dry-run profile. Quiet, held, stale, or incoherent LAST evidence leaves the
+Java child absent; a fresh bridge-validated route starts one
+`run-notarb-last-target-live.sh` child. The Windows `.cmd` wrapper remains for
+local development only.
 
-The Jito sender intentionally permits an empty UUID, matching NotArb's bundled
-base configuration. Tips and priority fees are capped at 25,000 lamports and
-the no-UUID cooldown is 1,000 ms. `token_accounts_checker` is configured
-separately because the live bot needs current token-account visibility for its
-own keypair.
+The ordinary-RPC sender is `spam1`; it uses the configured Helius endpoint,
+keeps `require_profit = true`, and has no Jito tip. Priority fees remain capped
+at 25,000 lamports and the cooldown is 1,000 ms. `token_accounts_checker`
+remains configured separately because the live bot needs current token-account
+visibility for its own keypair.
 
 ## Runtime evidence
 

@@ -4,6 +4,74 @@ This guide is enough to reproduce the current dry-run and activity-gated live
 profiles from a clean clone. It deliberately does not include a wallet or SSH
 private key.
 
+## 82.23.138.51 deployment target
+
+The server layout and systemd templates are prepared for
+`root@82.23.138.51`, not the Windows workstation. The services are currently
+stopped and their installed unit files have been removed; use the clean
+deployment steps below when deployment is explicitly resumed:
+
+```bash
+systemctl status notarb-last-pipeline.service
+systemctl status notarb-last-live-supervisor.service
+```
+
+`notarb-last-pipeline.service` runs the Yellowstone observer plus compiled Rust
+bridge. `notarb-last-live-supervisor.service` runs continuously but starts the
+NotArb Java child only for a fresh, bridge-validated `active` LAST lease.
+`held`, quiet, stale, or incoherent status is normal and leaves the child
+absent. The current server paths are:
+
+```text
+/opt/notarb-last                 runtime source, JAR, and generated evidence
+/etc/notarb-last                 0700 private config directory
+/etc/notarb-last/keypair.json    0600 bot keypair
+/etc/notarb-last/notarb-last-grpc-live.toml  0600 live config
+/var/lib/notarb-last/rust-target compiled Rust target directory
+```
+
+When deployed, the server connects directly to `82.39.215.201:10000` (gRPC) and
+`82.39.215.201:8899` (read RPC). `[[spam_rpc]] spam1` is the single ordinary
+Helius sending endpoint. There are no Windows/WSL observer processes or local
+SSH tunnels in this deployment.
+
+## Deploy from a clean clone to a new 82.23 host
+
+1. Install Node 22+, Java 25, and Rust/Cargo 1.75+ on the server. Create the
+   paths above, with `/etc/notarb-last` mode `0700` and its private files mode
+   `0600`.
+2. Copy this repository to `/opt/notarb-last`, run `npm ci --ignore-scripts`,
+   and copy the matching NotArb JAR to `/opt/notarb-last/.notarb-1.1.2.jar`.
+   Keep runtime source root-owned and remove group/other write permission.
+3. Create `/etc/notarb-last/notarb-last-grpc-live.toml` from the tracked
+   example, set the bot keypair and Helius API key, and change every loader
+   read RPC plus `grpc_url` to the direct 82.39 endpoints. Do not commit this
+   file or the keypair.
+4. Install `deploy/systemd/notarb-last-pipeline.service` and
+   `deploy/systemd/notarb-last-live-supervisor.service` under
+   `/etc/systemd/system/`, then run:
+
+   ```bash
+   systemctl daemon-reload
+   systemctl enable --now notarb-last-pipeline.service
+   systemctl enable --now notarb-last-live-supervisor.service
+   ```
+
+5. Verify the config without printing its secret URL, then inspect the two
+   service states and logs:
+
+   ```bash
+   LAST_READ_RPC_URL=http://82.39.215.201:8899 \
+     node /opt/notarb-last/assert-last-live.mjs \
+       /etc/notarb-last/notarb-last-grpc-live.toml
+   systemctl --no-pager --full status notarb-last-pipeline.service notarb-last-live-supervisor.service
+   tail -n 50 /opt/notarb-last/last-route-rust.stderr.log
+   tail -n 50 /opt/notarb-last/last-notarb-live-supervisor.stdout.log
+   ```
+
+Before enabling this server on a migration, stop every prior live supervisor
+and its child tree elsewhere so two runtimes never send at the same time.
+
 ## What you need outside this repository
 
 1. Git and Node.js 20.18 or newer.
@@ -31,7 +99,7 @@ node --version
 
 The package lock pins the Yellowstone client used by `grpc-last.mjs`.
 
-## Create the two 82 tunnels
+## Optional legacy local-development tunnels
 
 Run each in a separate PowerShell window and keep both windows open. Replace
 the key path if yours differs.
@@ -194,12 +262,13 @@ node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
 npm run supervise:last:live
 ```
 
-The profile has `transaction_executor.threads = 1`, one Jito Amsterdam sender,
-an enabled SOL strategy, and `[swap.strategy_defaults] flash_loan = true`.
+The profile has `transaction_executor.threads = 1`, one ordinary Helius
+`[[spam_rpc]]` sender, an enabled SOL strategy, and
+`[swap.strategy_defaults] flash_loan = true`.
 It keeps `[notarb_markets] enabled = false`, loading only the current
 `last-target-markets.json` and `last-target-lookup-tables.txt` written by the
-LAST bridge. The Jito UUID may remain empty; the profile keeps a 1,000 ms
-cooldown and caps priority fee and tip at 25,000 lamports.
+LAST bridge. The profile keeps `require_profit = true`, a 1,000 ms cooldown,
+and a 25,000-lamport priority-fee cap; ordinary RPC sends have no Jito tip.
 
 The live child starts only for a fresh bridge-validated LAST route and stops
 when the lease becomes quiet, held, stale, or incoherent. Its logs are

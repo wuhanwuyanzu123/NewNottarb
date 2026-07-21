@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Guard the local LAST live runner. It checks that the process remains
-// target-only while explicitly enabling one Jito sender and flash loans.
+// target-only while explicitly enabling one ordinary Helius RPC sender and
+// flash loans. Read/load RPCs must match the configured LAST_READ_RPC_URL.
 
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -8,6 +9,11 @@ import process from 'node:process';
 
 const configPath = process.argv[2];
 if (!configPath) fail('Usage: node assert-last-live.mjs <config.toml>');
+const readRpcUrl = process.env.LAST_READ_RPC_URL ?? 'http://127.0.0.1:18899';
+if (!/^https?:\/\/[^\s]+$/i.test(readRpcUrl) || /REPLACE_WITH_/i.test(readRpcUrl)) {
+  fail('LAST_READ_RPC_URL must be a configured HTTP(S) read RPC endpoint.');
+}
+const expectedReadRpcValue = JSON.stringify(readRpcUrl);
 
 const text = await readFile(configPath, 'utf8');
 const sections = [];
@@ -66,14 +72,21 @@ const tokenAccounts = exactlyOne('token_accounts_checker');
 const tokenAccountsRpc = stringValue(tokenAccounts, 'rpc_url');
 if (!tokenAccountsRpc || /^REPLACE_WITH_/i.test(tokenAccountsRpc)) fail('[token_accounts_checker] rpc_url must be configured.');
 expect(tokenAccounts, 'delay_seconds', '3');
+for (const readRpcSection of ['blockhash_updater', 'price_updater', 'token_accounts_checker', 'market_loader', 'lookup_table_loader']) {
+  expect(exactlyOne(readRpcSection), 'rpc_url', expectedReadRpcValue);
+}
 exactlyOneEnabledPath('markets_file', 'last-target-markets.json');
 exactlyOneEnabledPath('lookup_tables_file', 'last-target-lookup-tables.txt');
 
-const sender = exactlyOne('sender');
-expect(sender, 'id', '"jito-ams"');
-expect(sender, 'url', '"https://amsterdam.mainnet.block-engine.jito.wtf"');
-expect(sender, 'tip_type', '"jito"');
-if (!sender.values.has('uuid')) fail('[[sender]] uuid must be present.');
+if (named('sender').length !== 0) fail('[[sender]] must be absent for the ordinary-RPC LAST profile.');
+const spamRpc = exactlyOne('spam_rpc');
+expect(spamRpc, 'enabled', 'true');
+expect(spamRpc, 'id', '"spam1"');
+const sendingRpcUrl = stringValue(spamRpc, 'url');
+if (!/^https:\/\/mainnet\.helius-rpc\.com\/\?api-key=.+$/i.test(sendingRpcUrl)
+  || /REPLACE_WITH_/i.test(sendingRpcUrl)) {
+  fail('[[spam_rpc]] url must be a configured Helius mainnet RPC endpoint.');
+}
 
 const swap = exactlyOne('swap');
 expect(swap, 'enabled', 'true');
@@ -82,18 +95,21 @@ expect(defaults, 'flash_loan', 'true');
 const strategy = exactlyOne('swap.strategy');
 expect(strategy, 'enabled', 'true');
 const strategySenders = strategy.values.get('senders') ?? '';
-if (!/id\s*=\s*"jito-ams"/.test(strategySenders)
+if (!/id\s*=\s*"spam1"/.test(strategySenders)
+  || !/max_retries\s*=\s*0/.test(strategySenders)
   || !/require_profit\s*=\s*true/.test(strategySenders)
-  || !/min_tip\s*=\s*1000/.test(strategySenders)
-  || !/max_tip\s*=\s*25000/.test(strategySenders)) {
-  fail('[[swap.strategy]] senders must use jito-ams with 1000..25000 tips and require_profit=true.');
+  || /jito|\bmin_tip\b|\bmax_tip\b/i.test(strategySenders)) {
+  fail('[[swap.strategy]] senders must use only spam1 with max_retries=0 and require_profit=true.');
 }
+expect(strategy, 'cu_limit', '369100');
+expect(strategy, 'min_priority_fee_lamports', '1000');
+expect(strategy, 'max_priority_fee_lamports', '25000');
 expect(strategy, 'cooldown_ms', '1000');
 
 console.log(JSON.stringify({
   status: 'last_live_config_valid',
   configPath,
-  sender: sender.values.get('id')?.replace(/^"|"$/g, '') ?? null,
+  sender: spamRpc.values.get('id')?.replace(/^"|"$/g, '') ?? null,
   flashLoan: defaults.values.get('flash_loan') === 'true',
 }));
 

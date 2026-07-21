@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compile outside the Windows-mounted worktree, then run the Rust bridge against
-# the existing LAST evidence and local SSH forwards.  Pass any bridge flags
-# (for example --once) through unchanged.
+# Compile outside a Windows-mounted worktree when needed, then run the Rust
+# bridge against the existing LAST evidence and configured read RPC. Pass any
+# bridge flags (for example --once) through unchanged.
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${LAST_ROUTE_ROOT:-$(cd "$SOURCE_DIR/../.." && pwd)}"

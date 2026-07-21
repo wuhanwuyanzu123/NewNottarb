@@ -1,0 +1,23 @@
+[Unit]
+Description=LAST Yellowstone observer and Rust route bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/notarb-last
+UMask=0077
+Environment=NODE_BIN=/usr/bin/node
+Environment=YELLOWSTONE_GRPC_ENDPOINT=http://82.39.215.201:10000
+Environment=LAST_READ_RPC_URL=http://82.39.215.201:8899
+Environment=CARGO_BIN=/opt/notarb-last/.cargo/bin/cargo
+Environment=LAST_ROUTE_CARGO_TARGET_DIR=/var/lib/notarb-last/rust-target
+ExecStart=/usr/bin/bash /opt/notarb-last/run-last-rust-pipeline.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

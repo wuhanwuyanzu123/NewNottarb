@@ -82,6 +82,16 @@ struct Account {
     data: Option<Vec<u8>>,
 }
 
+// A missing JSONL file is normal while the observer is starting, and a JSONL
+// stream can legitimately contain transactions that are unrelated to a
+// usable LAST route.  Keep those cases distinct from malformed completed
+// JSONL and read/RPC failures: only the latter should be surfaced as bridge
+// errors.
+enum LatestEvent {
+    Route(Value),
+    NoRouteEvidence { events_file_present: bool },
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!(
@@ -230,9 +240,18 @@ fn is_route_evidence(event: &Value) -> bool {
         && !candidate_dexes(event).is_empty()
 }
 
-fn load_latest_event(path: &Path) -> Result<Value> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("read events: {}", path.display()))?;
+fn load_latest_event(path: &Path) -> Result<LatestEvent> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LatestEvent::NoRouteEvidence {
+                events_file_present: false,
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read events: {}", path.display()))
+        }
+    };
     let ended = text.ends_with('\n') || text.ends_with("\r\n");
     let lines: Vec<&str> = text.lines().collect();
     for (reverse_index, line) in lines.iter().rev().enumerate() {
@@ -240,13 +259,15 @@ fn load_latest_event(path: &Path) -> Result<Value> {
             continue;
         }
         match serde_json::from_str::<Value>(line) {
-            Ok(event) if is_route_evidence(&event) => return Ok(event),
+            Ok(event) if is_route_evidence(&event) => return Ok(LatestEvent::Route(event)),
             Ok(_) => continue,
             Err(_error) if reverse_index == 0 && !ended => continue,
             Err(error) => return Err(error).context("malformed completed JSONL event"),
         }
     }
-    Err(anyhow!("no route evidence for {WATCHED_ADDRESS}"))
+    Ok(LatestEvent::NoRouteEvidence {
+        events_file_present: true,
+    })
 }
 
 fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -667,6 +688,62 @@ fn publish_status(path: &Path, status: Value) -> Result<bool> {
     Ok(changed)
 }
 
+fn publish_no_route_evidence_status(
+    options: &Options,
+    status_path: &Path,
+    events_file_present: bool,
+) -> Result<()> {
+    // Do not touch route, markets, bridge-state, or observer-state artifacts
+    // here. A held status is enough for the lifecycle supervisor to stop a
+    // previously managed child, while avoiding a fabricated active route when
+    // the observer has not yielded one.
+    let source = json!({
+        "watchedAddress":WATCHED_ADDRESS,
+        "signature":Value::Null,
+        "slot":Value::Null,
+        "observedAt":Value::Null,
+    });
+    let details = json!({
+        "eventsPath":options.events.display().to_string(),
+        "eventsFilePresent":events_file_present,
+        "watchedAddress":WATCHED_ADDRESS,
+    });
+    let fingerprint = sha256(&json!({
+        "status":"held",
+        "reason":"no_route_evidence",
+        "details":details,
+    }));
+    let status = json!({
+        "status":"held",
+        "reason":"no_route_evidence",
+        "fingerprint":fingerprint,
+        "source":source,
+        "observer":{
+            "lastObservedAt":Value::Null,
+            "lastSignature":Value::Null,
+            "lastSlot":Value::Null,
+            "routeEvidenceFingerprint":Value::Null,
+            "stale":true,
+            "routeEvidencePresent":false,
+        },
+        "activity":Value::Null,
+        "activeTarget":Value::Null,
+        "details":details,
+    });
+    if publish_status(status_path, status)? {
+        eprintln!(
+            "{}",
+            json!({
+                "status":"target_route_held",
+                "reason":"no_route_evidence",
+                "eventsPath":options.events.display().to_string(),
+                "eventsFilePresent":events_file_present,
+            })
+        );
+    }
+    Ok(())
+}
+
 fn publish_observer_state(path: &Path, event: &Value, fingerprint: &str) -> Result<bool> {
     let changed = read_json_if_present(path)?
         .map(|previous| {
@@ -714,7 +791,23 @@ fn refresh_unchanged_route_automation(
 }
 
 fn build(options: &Options) -> Result<()> {
-    let event = load_latest_event(&options.events)?;
+    let (
+        markets_path,
+        route_path,
+        lookup_path,
+        status_path,
+        bridge_state_path,
+        observer_state_path,
+    ) = status_paths(&options.root);
+    let event = match load_latest_event(&options.events)? {
+        LatestEvent::Route(event) => event,
+        LatestEvent::NoRouteEvidence {
+            events_file_present,
+        } => {
+            publish_no_route_evidence_status(options, &status_path, events_file_present)?;
+            return Ok(());
+        }
+    };
     let source = source_for(&event);
     let route_evidence_fingerprint = json_route_evidence_fingerprint(&event);
     let stale = event_is_stale(&event, options.max_observer_staleness);
@@ -725,14 +818,6 @@ fn build(options: &Options) -> Result<()> {
         "observedAt":event.get("observedAt").cloned().unwrap_or(Value::Null),
         "routeEvidenceFingerprint":route_evidence_fingerprint,
     });
-    let (
-        markets_path,
-        route_path,
-        lookup_path,
-        status_path,
-        bridge_state_path,
-        observer_state_path,
-    ) = status_paths(&options.root);
     publish_observer_state(&observer_state_path, &event, &route_evidence_fingerprint)?;
     let bridge_state = read_json_if_present(&bridge_state_path)?;
     let active_target = bridge_state.as_ref().map(|state| {
@@ -969,6 +1054,44 @@ fn build(options: &Options) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn fixture_directory(name: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "last-route-bridge-{name}-{}-{}",
+            process::id(),
+            now_ms()
+        ))
+    }
+
+    fn offline_options(root: PathBuf, events: PathBuf) -> Options {
+        Options {
+            root,
+            events,
+            // A no-listener endpoint makes an accidental read-RPC call fail
+            // deterministically. The no-evidence paths must return before it
+            // is ever used.
+            rpc_url: "http://127.0.0.1:1".to_owned(),
+            interval: Duration::from_secs(5),
+            max_observer_staleness: Duration::from_secs(30),
+            once: true,
+            max_markets: 4,
+        }
+    }
+
+    fn assert_no_active_outputs(directory: &Path) {
+        for name in [
+            "last-target-markets.json",
+            "last-target-route.json",
+            "last-target-lookup-tables.txt",
+            ".last-route-bridge-state.json",
+            ".last-grpc-state.json",
+        ] {
+            assert!(
+                !directory.join(name).exists(),
+                "no route evidence must not write {name}"
+            );
+        }
+    }
+
     #[test]
     fn recognizes_orca_whirlpool_pool_state() {
         let layout = find_layout("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")
@@ -1068,6 +1191,88 @@ mod tests {
             json!("2026-07-21T05:17:57.570Z"),
         )
         .expect("unchanged refresh is a no-op"));
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn missing_events_publish_held_no_route_evidence_once_without_active_outputs() {
+        let directory = fixture_directory("missing-events");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events.clone());
+
+        build(&options).expect("missing events are a held state, not an error");
+        let first_status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read held status")
+            .expect("held status exists");
+        assert_eq!(first_status.get("status"), Some(&json!("held")));
+        assert_eq!(
+            first_status.get("reason"),
+            Some(&json!("no_route_evidence"))
+        );
+        assert_eq!(
+            value_path(&first_status, &["details", "eventsPath"]),
+            Some(&json!(events.display().to_string()))
+        );
+        assert_eq!(
+            value_path(&first_status, &["details", "eventsFilePresent"]),
+            Some(&json!(false))
+        );
+        assert_eq!(first_status.get("activity"), Some(&Value::Null));
+        assert_no_active_outputs(&directory);
+
+        // Repeating the idle tick must neither issue a read-RPC request nor
+        // churn status generatedAt/fingerprint every interval.
+        build(&options).expect("repeated missing events stay held");
+        let second_status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read repeated held status")
+            .expect("repeated held status exists");
+        assert_eq!(first_status, second_status);
+        assert_no_active_outputs(&directory);
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn non_qualifying_jsonl_event_is_held_without_active_route_or_read_rpc() {
+        let directory = fixture_directory("no-route-evidence");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        // The watched address is present, but the observer did not classify
+        // this record as matched NotArb route evidence.
+        fs::write(
+            &events,
+            format!(
+                "{}\n",
+                json!({
+                    "watch":{"address":WATCHED_ADDRESS},
+                    "success":true,
+                    "notArb":{"matched":false},
+                    "accountKeys":[{"pubkey":"not-a-pool","writable":true}],
+                    "arbitrageIntent":{
+                        "mints":[{"mint":WSOL_MINT}],
+                        "dexPrograms":[{"programId":POOL_LAYOUTS[0].program_id}],
+                    },
+                })
+            ),
+        )
+        .expect("write non-route fixture event");
+        let options = offline_options(directory.clone(), events);
+
+        build(&options).expect("non-route evidence is a held state, not an RPC error");
+        let status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read held status")
+            .expect("held status exists");
+        assert_eq!(status.get("status"), Some(&json!("held")));
+        assert_eq!(status.get("reason"), Some(&json!("no_route_evidence")));
+        assert_eq!(
+            value_path(&status, &["details", "eventsFilePresent"]),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            value_path(&status, &["observer", "routeEvidencePresent"]),
+            Some(&json!(false))
+        );
+        assert_no_active_outputs(&directory);
         fs::remove_dir_all(&directory).expect("remove fixture directory");
     }
 }

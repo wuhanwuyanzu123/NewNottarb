@@ -1,7 +1,8 @@
 # Copy to notarb-last-grpc-live.toml and set the dedicated funded bot keypair.
 # This configuration is target-only: the LAST bridge supplies its exact markets
-# and ALTs; the global scanner stays off. The default sender is the official
-# unauthenticated Jito endpoint so it can run without an API key or UUID.
+# and ALTs; the global scanner stays off. The default sender is one ordinary
+# Solana JSON-RPC endpoint. Configure the reader/load RPCs below consistently
+# with the deployment's LAST_READ_RPC_URL.
 
 [notarb]
 acknowledge_terms_of_service = true
@@ -18,8 +19,8 @@ delay_ms = 250
 rpc_url = "http://127.0.0.1:18899"
 
 [token_accounts_checker]
-# Keep this pointed at the local read-RPC tunnel.  A node with a full
-# token-account index gives the live bot complete owned-ATA visibility.
+# Use the configured read endpoint. A node with a full token-account index
+# gives the live bot complete owned-ATA visibility.
 rpc_url = "http://127.0.0.1:18899"
 delay_seconds = 3
 
@@ -50,11 +51,10 @@ enabled = false
 dry_run = false
 grpc_url = "http://127.0.0.1:18100"
 
-[[sender]]
-id = "jito-ams"
-url = "https://amsterdam.mainnet.block-engine.jito.wtf"
-tip_type = "jito"
-uuid = ""
+[[spam_rpc]]
+enabled = true
+id = "spam1"
+url = "https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY"
 
 [[swap]]
 enabled = true
@@ -71,4 +71,4 @@ cu_limit = 369100
 min_priority_fee_lamports = 1000
 max_priority_fee_lamports = 25000
 cooldown_ms = 1000
-senders = [{ id = "jito-ams", min_tip = 1000, max_tip = 25000, require_profit = true }]
+senders = [{ id = "spam1", max_retries = 0, require_profit = true }]

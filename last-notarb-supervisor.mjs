@@ -10,7 +10,7 @@
  * whether the child is a dry-run or a live sender.
  */
 
-import { readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve } from 'node:path';
@@ -18,6 +18,7 @@ import process from 'node:process';
 
 const WATCHED_ADDRESS = 'LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9';
 const execFileAsync = promisify(execFile);
+const IS_WINDOWS = process.platform === 'win32';
 const args = parseArgs(process.argv.slice(2));
 const ROOT = resolve(args.get('root') ?? process.cwd());
 const STATUS_PATH = resolve(ROOT, args.get('status') ?? 'last-target-status.json');
@@ -36,6 +37,7 @@ const IDLE_MS = boundedNumber(args.get('idle-seconds'), 30, 5, 600) * 1_000;
 // immediately through the status gate below.
 const MAX_MARKETS_AGE_MS = boundedNumber(args.get('max-markets-age-seconds'), 20, 2, 120) * 1_000;
 const TRANSITION_GRACE_MS = boundedNumber(args.get('transition-grace-ms'), 7_000, 500, 15_000);
+const POSIX_STOP_GRACE_MS = boundedNumber(args.get('posix-stop-grace-ms'), 2_000, 250, 15_000);
 const ONCE = args.has('once');
 
 let stopping = false;
@@ -158,14 +160,34 @@ function eligibleFailure(reason, details = {}) {
 
 async function currentEligibility() {
   let status;
+  // A published non-active status is sufficient to keep the child stopped.
+  // In particular, the bridge deliberately publishes `held`/
+  // `no_route_evidence` before it has (or needs) route, observer, and markets
+  // evidence.  Do not turn that normal quiet state into an
+  // `evidence_unreadable` error by reading files which are irrelevant until an
+  // active lease is announced.
   let observer;
   let route;
   let markets;
   let statusFile;
   let marketsFile;
   try {
-    [status, observer, route, markets, statusFile, marketsFile] = await Promise.all([
-      readJson(STATUS_PATH),
+    status = await readJson(STATUS_PATH);
+  } catch (error) {
+    return eligibleFailure('evidence_unreadable', { error: String(error.message ?? error) });
+  }
+
+  if (status?.status !== 'active') {
+    return eligibleFailure('route_not_active', {
+      routeStatus: status?.status ?? null,
+      routeStatusReason: status?.reason ?? null,
+    });
+  }
+
+  // Active leases must still have the full, coherent evidence set before the
+  // supervisor may start or retain a child.
+  try {
+    [observer, route, markets, statusFile, marketsFile] = await Promise.all([
       readJson(OBSERVER_STATE_PATH),
       readJson(ROUTE_PATH),
       readJson(MARKETS_PATH),
@@ -176,7 +198,6 @@ async function currentEligibility() {
     return eligibleFailure('evidence_unreadable', { error: String(error.message ?? error) });
   }
 
-  if (status?.status !== 'active') return eligibleFailure('route_not_active', { routeStatus: status?.status ?? null, reason: status?.reason ?? null });
   const activity = status?.activity;
   if (!activity?.signature || !activity?.observedAt) return eligibleFailure('missing_validated_activity');
   if (!observer?.lastRouteSignature || !observer?.lastRouteObservedAt) return eligibleFailure('missing_route_activity');
@@ -281,7 +302,7 @@ function powerShellQuoted(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-async function processForPid(pid) {
+async function windowsProcessForPid(pid) {
   const script = [
     `$process = Get-CimInstance Win32_Process -Filter 'ProcessId = ${Number(pid)}'`,
     "if ($null -ne $process) { [PSCustomObject]@{ ProcessId = $process.ProcessId; Name = $process.Name; CommandLine = $process.CommandLine; CreationDate = $process.CreationDate } | ConvertTo-Json -Compress }",
@@ -295,7 +316,47 @@ async function processForPid(pid) {
   return text ? JSON.parse(text) : null;
 }
 
+async function posixProcessForPid(pid) {
+  try {
+    const procRoot = `/proc/${Number(pid)}`;
+    const [statText, commandBytes] = await Promise.all([
+      readFile(`${procRoot}/stat`, 'utf8'),
+      readFile(`${procRoot}/cmdline`, 'utf8'),
+    ]);
+    const closingParenthesis = statText.lastIndexOf(')');
+    const openingParenthesis = statText.indexOf('(');
+    if (openingParenthesis < 0 || closingParenthesis <= openingParenthesis) return null;
+    // `/proc/<pid>/stat` fields after `comm` start at field 3.  `starttime`
+    // is field 22 and `pgrp` is field 5; the former gives a PID-reuse-safe
+    // identity without relying on wall-clock parsing.
+    const fields = statText.slice(closingParenthesis + 2).trim().split(/\s+/);
+    const startTicks = fields[19];
+    const processGroupId = Number(fields[2]);
+    if (!startTicks || !Number.isInteger(processGroupId) || processGroupId < 1) return null;
+    return {
+      ProcessId: Number(pid),
+      Name: statText.slice(openingParenthesis + 1, closingParenthesis),
+      CommandLine: commandBytes.replace(/\0/g, ' ').trim(),
+      CreationDate: startTicks,
+      ProcessGroupId: processGroupId,
+    };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function processForPid(pid) {
+  return IS_WINDOWS ? windowsProcessForPid(pid) : posixProcessForPid(pid);
+}
+
 function isExpectedRunnerProcess(processInfo, expectedCreationDate = null) {
+  if (!IS_WINDOWS) {
+    return Boolean(
+      processInfo?.CommandLine?.includes(RUNNER_PATH)
+      && (!expectedCreationDate || String(processInfo?.CreationDate) === String(expectedCreationDate)),
+    );
+  }
   return Boolean(
     processInfo?.Name?.toLowerCase() === 'cmd.exe'
     && processInfo?.CommandLine?.toLowerCase().includes(RUNNER_PATH.toLowerCase())
@@ -319,6 +380,20 @@ async function ownedRootStatus(record) {
 }
 
 async function findExternalTargetBots() {
+  if (!IS_WINDOWS) {
+    const entries = await readdir('/proc', { withFileTypes: true });
+    const candidates = await Promise.all(entries
+      .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+      .map(async (entry) => processForPid(Number(entry.name)).catch(() => null)));
+    return candidates
+      .filter((processInfo) => {
+        const commandLine = processInfo?.CommandLine ?? '';
+        return processInfo?.ProcessId !== process.pid
+          && commandLine.includes(CONFIG_PATH)
+          && (commandLine.includes(RUNNER_PATH) || commandLine.includes('onchain-bot'));
+      })
+      .map((processInfo) => processInfo.ProcessId);
+  }
   const target = powerShellQuoted(CONFIG_PATH);
   const script = [
     `$target = ${target}`,
@@ -337,6 +412,7 @@ async function findExternalTargetBots() {
 }
 
 async function ownedDescendants(rootPid) {
+  if (!IS_WINDOWS) return [];
   const script = [
     `$root = ${Number(rootPid)}`,
     "$all = @(Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate)",
@@ -373,6 +449,7 @@ function sameProcessIdentity(processInfo, expected) {
 }
 
 async function terminateRecordedDescendants(descendants) {
+  if (!IS_WINDOWS) return;
   const survivors = [];
   for (const descendant of descendants) {
     const processInfo = await processForPid(descendant.ProcessId).catch(() => null);
@@ -392,6 +469,55 @@ async function terminateRecordedDescendants(descendants) {
   if (survivors.length) throw new Error(`owned_descendants_survived_stop:${survivors.join(',')}`);
 }
 
+function recordProcessGroupId(record) {
+  const value = Number(record?.processGroupId ?? record?.rootPid);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function signalPosixProcessGroup(processGroupId, signal) {
+  try {
+    process.kill(-processGroupId, signal);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
+async function posixProcessGroupMembers(processGroupId) {
+  const entries = await readdir('/proc', { withFileTypes: true });
+  const candidates = await Promise.all(entries
+    .filter((entry) => entry.isDirectory() && /^\d+$/.test(entry.name))
+    .map(async (entry) => processForPid(Number(entry.name)).catch(() => null)));
+  return candidates.filter((processInfo) => Number(processInfo?.ProcessGroupId) === processGroupId);
+}
+
+async function terminatePosixProcessGroup(record, allowMissingRoot = false) {
+  const processGroupId = recordProcessGroupId(record);
+  if (!processGroupId) throw new Error(`owned_process_group_invalid:${record?.rootPid ?? 'unknown'}`);
+  const root = await processForPid(record.rootPid).catch(() => null);
+  if (root && !isExpectedRunnerProcess(root, record.rootCreationDate)) {
+    throw new Error(`owned_runner_pid_reused:${record.rootPid}`);
+  }
+  if (!root && allowMissingRoot) {
+    const members = await posixProcessGroupMembers(processGroupId);
+    if (members.length && !members.some((member) => (member.CommandLine ?? '').includes(CONFIG_PATH))) {
+      throw new Error(`owned_process_group_identity_unavailable:${processGroupId}`);
+    }
+  }
+  if (!signalPosixProcessGroup(processGroupId, 'SIGTERM')) return;
+  const deadline = Date.now() + POSIX_STOP_GRACE_MS;
+  while (Date.now() < deadline) {
+    await pause(100);
+    if (!signalPosixProcessGroup(processGroupId, 0)) return;
+  }
+  if (!signalPosixProcessGroup(processGroupId, 'SIGKILL')) return;
+  await pause(100);
+  if (signalPosixProcessGroup(processGroupId, 0)) {
+    throw new Error(`owned_process_group_survived_stop:${processGroupId}`);
+  }
+}
+
 async function recoverOwnedChild() {
   const saved = await readJsonIfPresent(STATE_PATH);
   if (saved?.phase !== 'running' || saved.configPath !== CONFIG_PATH || saved.runnerPath !== RUNNER_PATH
@@ -402,6 +528,7 @@ async function recoverOwnedChild() {
     ownedBot = {
       rootPid: saved.rootPid,
       rootCreationDate: saved.rootCreationDate,
+      processGroupId: IS_WINDOWS ? null : recordProcessGroupId(saved),
       activationKey: saved.activationKey ?? null,
       generation: saved.generation ?? null,
       startedAt: saved.startedAt ?? null,
@@ -423,6 +550,7 @@ function attachChildExit(child, record) {
     void saveSupervisorState(intentionalStop ? 'stopped' : 'exited', {
       rootPid: record.rootPid,
       rootCreationDate: record.rootCreationDate,
+      processGroupId: record.processGroupId ?? null,
       activationKey: record.activationKey,
       generation: record.generation,
       exitCode: code,
@@ -439,13 +567,20 @@ async function startOwnedBot(eligibility) {
     return false;
   }
   const assertResult = await assertConfig();
-  // Passing the batch file as the /c command lets cmd.exe own the complete
-  // wrapper tree.  The root PID is then safe to terminate with taskkill /T.
-  const child = spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', RUNNER_PATH, CONFIG_PATH, '--managed-by-last-supervisor'], {
-    cwd: ROOT,
-    windowsHide: true,
-    stdio: 'ignore',
-  });
+  // Windows uses cmd.exe so its batch wrapper owns the complete tree. POSIX
+  // uses a dedicated process group led by bash, allowing the same precise
+  // child-only stop semantics without touching observer or bridge processes.
+  const child = IS_WINDOWS
+    ? spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/c', RUNNER_PATH, CONFIG_PATH, '--managed-by-last-supervisor'], {
+      cwd: ROOT,
+      windowsHide: true,
+      stdio: 'ignore',
+    })
+    : spawn(process.env.LAST_RUNNER_SHELL ?? '/bin/bash', [RUNNER_PATH, CONFIG_PATH, '--managed-by-last-supervisor'], {
+      cwd: ROOT,
+      detached: true,
+      stdio: 'ignore',
+    });
   await new Promise((resolveSpawn, rejectSpawn) => {
     child.once('spawn', resolveSpawn);
     child.once('error', rejectSpawn);
@@ -454,6 +589,7 @@ async function startOwnedBot(eligibility) {
   const record = {
     rootPid: child.pid,
     rootCreationDate: rootProcess.CreationDate,
+    processGroupId: IS_WINDOWS ? null : rootProcess.ProcessGroupId,
     activationKey: eligibility.activationKey,
     generation: eligibility.generation,
     startedAt: nowIso(),
@@ -466,6 +602,7 @@ async function startOwnedBot(eligibility) {
   await saveSupervisorState('running', {
     rootPid: record.rootPid,
     rootCreationDate: record.rootCreationDate,
+    processGroupId: record.processGroupId ?? null,
     activationKey: record.activationKey,
     generation: record.generation,
     startedAt: record.startedAt,
@@ -485,24 +622,29 @@ async function stopOwnedBot(reason) {
   const current = ownedBot;
   if (!current) return false;
   current.intentionalStop = true;
-  const descendants = await ownedDescendants(current.rootPid);
-  try {
-    await execFileAsync('taskkill.exe', ['/PID', String(current.rootPid), '/T', '/F'], {
-      windowsHide: true,
-      timeout: 10_000,
-      maxBuffer: 64 * 1024,
-    });
-  } catch (error) {
-    // A just-exited child makes taskkill return non-zero; verify its root PID
-    // before reporting a stop failure.
-    const remaining = await processForPid(current.rootPid).catch(() => null);
-    if (isExpectedRunnerProcess(remaining, current.rootCreationDate)) throw error;
+  if (IS_WINDOWS) {
+    const descendants = await ownedDescendants(current.rootPid);
+    try {
+      await execFileAsync('taskkill.exe', ['/PID', String(current.rootPid), '/T', '/F'], {
+        windowsHide: true,
+        timeout: 10_000,
+        maxBuffer: 64 * 1024,
+      });
+    } catch (error) {
+      // A just-exited child makes taskkill return non-zero; verify its root PID
+      // before reporting a stop failure.
+      const remaining = await processForPid(current.rootPid).catch(() => null);
+      if (isExpectedRunnerProcess(remaining, current.rootCreationDate)) throw error;
+    }
+    await terminateRecordedDescendants(descendants);
+  } else {
+    await terminatePosixProcessGroup(current);
   }
-  await terminateRecordedDescendants(descendants);
   if (ownedBot?.rootPid === current.rootPid) ownedBot = null;
   await saveSupervisorState('stopped', {
     rootPid: current.rootPid,
     rootCreationDate: current.rootCreationDate,
+    processGroupId: current.processGroupId ?? null,
     activationKey: current.activationKey,
     generation: current.generation,
     stoppedAt: nowIso(),
@@ -549,15 +691,23 @@ async function reconcile() {
     if (ownedBot && rootStatus !== 'alive') {
       const exited = ownedBot;
       if (rootStatus === 'missing') {
-        // Child processes retain their former ParentProcessId after a broken
-        // wrapper exits. They are still the recorded tree while that PID is
-        // absent, so terminate and verify them before forgetting ownership.
-        await terminateRecordedDescendants(await ownedDescendants(exited.rootPid));
+        if (IS_WINDOWS) {
+          // Child processes retain their former ParentProcessId after a broken
+          // wrapper exits. They are still the recorded tree while that PID is
+          // absent, so terminate and verify them before forgetting ownership.
+          await terminateRecordedDescendants(await ownedDescendants(exited.rootPid));
+        } else {
+          // The POSIX runner is a dedicated process-group leader.  A broken
+          // shell can leave its Java child in that group, so stop only that
+          // validated group before forgetting ownership.
+          await terminatePosixProcessGroup(exited, true);
+        }
       }
       ownedBot = null;
       await saveSupervisorState('exited', {
         rootPid: exited.rootPid,
         rootCreationDate: exited.rootCreationDate,
+        processGroupId: exited.processGroupId ?? null,
         activationKey: exited.activationKey,
         generation: exited.generation,
         reason: rootStatus === 'missing' ? 'owned_runner_no_longer_exists' : 'owned_runner_pid_reused',
@@ -571,9 +721,15 @@ async function reconcile() {
       if (ownedBot.activationKey !== eligibility.activationKey) {
         ownedBot.activationKey = eligibility.activationKey;
         ownedBot.generation = eligibility.generation;
+        // A single managed child may follow several fresh LAST signatures in
+        // place.  Retain the latest key as attempted too, so if that child is
+        // later stopped by a quiet lease, replaying the final signature cannot
+        // start a duplicate child.
+        attemptedActivationKey = eligibility.activationKey;
         await saveSupervisorState('running', {
           rootPid: ownedBot.rootPid,
           rootCreationDate: ownedBot.rootCreationDate,
+          processGroupId: ownedBot.processGroupId ?? null,
           activationKey: ownedBot.activationKey,
           generation: ownedBot.generation,
           startedAt: ownedBot.startedAt,

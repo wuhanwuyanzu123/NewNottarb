@@ -8,6 +8,7 @@
     "extract:last:markets": "node ./last-route-to-notarb.mjs --interval=5000 --max-observer-staleness-seconds=30",
     "supervise:last:dryrun": "node ./last-notarb-supervisor.mjs",
     "supervise:last:live": "node ./last-notarb-supervisor.mjs --config=./notarb-last-grpc-live.toml --assert=./assert-last-live.mjs --runner=./run-notarb-last-target-live.cmd --state=./.last-notarb-live-supervisor-state.json",
+    "supervise:last:live:linux": "bash ./run-last-notarb-live-supervisor.sh",
     "test:last:supervisor": "node ./test-last-notarb-supervisor.mjs",
     "test:last:bridge": "node ./test-last-route-bridge.mjs"
   },
