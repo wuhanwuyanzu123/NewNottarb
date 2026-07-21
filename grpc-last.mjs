@@ -477,7 +477,14 @@ function routeFingerprint(event) {
     intendedDexes: event.arbitrageIntent.dexPrograms.map((item) => item.programId).sort(),
     invokedDexes: event.execution.invokedPrograms.map((item) => item.programId).sort(),
     executionKind: event.execution.kind,
-    altTables: event.addressLookupTables.map((item) => item.address).sort(),
+    // The same ALT can hold many pool accounts. Its selected index set is part
+    // of the route identity, so a LAST pool rotation produces fresh evidence
+    // for last-route-to-notarb.mjs instead of being hidden as a duplicate.
+    altSelections: event.addressLookupTables.map((item) => ({
+      address: item.address,
+      writableIndexes: item.writableIndexes,
+      readonlyIndexes: item.readonlyIndexes,
+    })),
   });
 }
 

@@ -1,5 +1,5 @@
 # Copy to notarb-last-grpc-dryrun.toml, then set a dedicated wallet path.
-# This is a no-send NotArb onchain-bot validation configuration.
+# This is a no-send, LAST-targeted NotArb onchain-bot validation configuration.
 
 [notarb]
 acknowledge_terms_of_service = true
@@ -35,58 +35,34 @@ enabled = true
 path = "last-grpc-active-lookup-tables.txt"
 update_seconds = 30
 
+# Written by last-route-to-notarb.mjs from LAST gRPC evidence.
+[[markets_file]]
+enabled = true
+path = "last-target-markets.json"
+update_seconds = 15
+
 [wsol_unwrapper]
 enabled = false
 
-# Yellowstone market discovery: 127.0.0.1:18100 -> 82.39.215.201:10000.
+# Do not enable the global module: it scans the whole Yellowstone stream.
+# The target-only bridge above supplies the market group instead.
 [notarb_markets]
-enabled = true
+enabled = false
 dry_run = true
 grpc_url = "http://127.0.0.1:18100"
-update_ms = 5000
-half_life_ms = 180000
-threads = 1
-sort_mints_by = "total_volume"
-sort_markets_by = "total_volume"
-max_txs_per_strategy = 1
-max_tokens_per_tx = 2
-max_markets_per_token = 3
-max_markets_per_tx = 4
-exclude_mints = [
-  "So11111111111111111111111111111111111111112",
-  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-  "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-  "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB",
-]
-include_dexes = [
-  "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", # Pump.fun AMM
-  "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo", # Meteora DLMM
-]
-log_file_path = "notarb-last-grpc-markets.log"
 
-[notarb_markets.fees]
-window_ms = 300000
-min_samples = 100
-arb_programs = ["NA247a7YE9S3p9CdKmMyETx8TTwbSdVbVYHHxpnHTUV"]
-
-[[notarb_markets.filter]]
-id = 0
-min_total_txs = 1
-sort_markets_by = "total_volume"
-
-# A strategy is present only to validate the market handoff.  It cannot send:
-# the market module is dry-run, the default is disabled, and no sender exists.
+# A strategy is present only for config completeness.  It is disabled, and
+# there is no sender, nonce pool, or executor thread.
 [[swap]]
-enabled = true
+enabled = false
 mint = "SOL"
 
 [swap.strategy_defaults]
-supplier = "notarb"
 meteora_bin_limit = 16
 flash_loan = true
 
 [[swap.strategy]]
-enabled = { key = "notarb_0_enabled", default_value = false }
+enabled = false
 cu_limit = 369000
 min_priority_fee_lamports = 0
 max_priority_fee_lamports = 0

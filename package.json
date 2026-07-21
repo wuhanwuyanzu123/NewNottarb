@@ -4,7 +4,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "listen:last:grpc": "node ./grpc-last.mjs"
+    "listen:last:grpc": "node ./grpc-last.mjs",
+    "extract:last:markets": "node ./last-route-to-notarb.mjs"
   },
   "dependencies": {
     "@triton-one/yellowstone-grpc": "4.0.2"

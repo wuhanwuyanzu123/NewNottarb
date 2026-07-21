@@ -5,8 +5,9 @@
 - A standalone Yellowstone gRPC observer tracks `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through the 82 endpoint.
 - The observer keeps no-profit NotArb checks as arbitrage-intent evidence: mint, intended DEX programs, ALT tables, and a distinct `not_executed` price status.
 - The observed public ALT IDs are stored in `last-grpc-active-lookup-tables.txt`.
-- NotArb `onchain-bot` is running in a native `[notarb_markets]` dry-run mode against the same Yellowstone gRPC stream.
-- Native market discovery has confirmed the observed `5UoWzex7rVky9ZSHGQXQgAPsm8jDZQMFBGqch8L7pump` route as a NotArb target; it is discovering markets and ALTs without sending a transaction.
+- `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file`; it verifies DEX account owner and pool-state size through the 82 read-RPC tunnel before using an address.
+- The current target is `5UoWzex7rVky9ZSHGQXQgAPsm8jDZQMFBGqch8L7pump`. Its direct WSOL group consists of Pump.fun AMM `k1F3d5WQAtbrzkYtJuV7FJKcWuE72n3Rf4wWfGvy2kv` and Meteora DLMM `3MmyGFt8PLggposcCredKePikHYof34LQP6d5jBHcZua` / `4d8Vp7UdpkjG8aYKHPsnzjXSaxNhwHomrPD8Q612ixek`.
+- NotArb `onchain-bot` now loads only that target-specific `markets_file`; the global `[notarb_markets]` scan is disabled and no transaction is sent.
 
 ## Current topology
 
@@ -14,7 +15,10 @@
 82.39.215.201:10000 Yellowstone gRPC
   -> SSH jump 82.23.138.51
   -> 127.0.0.1:18100
-  -> grpc-last.mjs and [notarb_markets]
+  -> grpc-last.mjs
+  -> last-route-to-notarb.mjs
+  -> last-target-markets.json
+  -> NotArb [[markets_file]]
 
 82.39.215.201:8899 Solana JSON-RPC (account/blockhash/ALT reads)
   -> SSH jump 82.23.138.51
@@ -35,5 +39,6 @@
 ```powershell
 Copy-Item .\notarb-last-grpc-dryrun.example.toml .\notarb-last-grpc-dryrun.toml
 # Edit only the local copy to point at a test/unfunded keypair.
+npm run extract:last:markets
 & "$env:LOCALAPPDATA\notarb\bin\notarb.bat" onchain-bot .\notarb-last-grpc-dryrun.toml
 ```

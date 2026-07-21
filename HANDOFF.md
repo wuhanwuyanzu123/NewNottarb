@@ -37,7 +37,7 @@ Run each in a separate PowerShell window and keep both windows open. Replace
 the key path if yours differs.
 
 ```powershell
-# Yellowstone gRPC: market discovery and LAST observer
+# Yellowstone gRPC: LAST observer
 ssh -i "$env:USERPROFILE\.ssh\id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -N -L 127.0.0.1:18100:82.39.215.201:10000 root@82.23.138.51
 
 # Standard Solana JSON-RPC: read-only blockhash, market account, and ALT reads
@@ -63,7 +63,20 @@ The observer records NotArb's no-profit checks as route-intent evidence. A
 `No arbitrage profit found` log means no settled trade price; it does not mean
 the mint, DEX, or ALT data is discarded.
 
-## Start native NotArb market discovery in dry run
+## Build the LAST-only NotArb markets file
+
+In a fourth PowerShell window, keep the bridge running:
+
+```powershell
+npm run extract:last:markets
+```
+
+It reads only `last-grpc-events.jsonl`, validates candidate pool-state accounts
+through the local 82 read-RPC tunnel, and writes `last-target-markets.json`.
+The current route is `5Uo...pump` against WSOL, using one Pump.fun AMM and two
+Meteora DLMM pool states. The global NotArb market scanner is not used.
+
+## Start target-specific NotArb in dry run
 
 Create a noncommitted local config and replace only the keypair placeholder
 with your unfunded/test keypair path:
@@ -74,18 +87,17 @@ notepad .\notarb-last-grpc-dryrun.toml
 & "$env:LOCALAPPDATA\notarb\bin\notarb.bat" onchain-bot .\notarb-last-grpc-dryrun.toml
 ```
 
-Expected output appears roughly every five seconds:
+Expected output includes the target static group:
 
 ```text
-[notarb_markets] Update #...
-Mints: ... | Markets: ... | ALTs: ...
-Transactions (notarb_0_enabled)
+[markets_file] Groups: 1
+[on-chain-bot-...] INFO NotArb - Starting bot...
 ```
 
-This proves gRPC market discovery and NotArb market-group construction are
-connected. It does **not** send a transaction: `dry_run = true`, no sender is
-configured, the strategy defaults to disabled, the executor has zero threads,
-and no nonce pool exists.
+This proves LAST route extraction and NotArb market-file loading are connected.
+It does **not** send a transaction: the global scanner is disabled, every swap
+is disabled, no sender is configured, the executor has zero threads, and no
+nonce pool exists.
 
 ## Before any live change
 
