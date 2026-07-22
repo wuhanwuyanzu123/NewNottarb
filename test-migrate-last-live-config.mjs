@@ -51,7 +51,7 @@ try {
   await writeFile(join(directory, 'fixture-keypair.json'), '[]\n', 'utf8');
   await writeFile(configPath, hybrid, 'utf8');
 
-  const migrationArgs = [migration, configPath, `--reader-rpc=${readRpcUrl}`];
+  const migrationArgs = [migration, configPath];
   const migrated = await run(process.execPath, migrationArgs);
   if (migrated.code !== 0 || !migrated.stdout.includes('last_live_config_migrated_v1_1_2')) {
     throw new Error(`hybrid_profile_not_migrated:${migrated.stderr || migrated.stdout}`);
@@ -69,8 +69,15 @@ try {
   if (/require_profit\s*=/i.test(migratedText)) {
     throw new Error('hybrid_field_survived:require_profit');
   }
-  if (!new RegExp(`\\[token_accounts_checker\\][\\s\\S]*?rpc_url\\s*=\\s*"${readRpcUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`).test(migratedText)) {
-    throw new Error('reader_rpc_changed_during_migration');
+  const tokenLines = migratedText.split(/\r?\n/);
+  const tokenStart = tokenLines.findIndex((line) => line.trim() === '[token_accounts_checker]');
+  const tokenRest = tokenStart < 0 ? [] : tokenLines.slice(tokenStart + 1);
+  const tokenEnd = tokenRest.findIndex((line) => /^\s*\[/.test(line));
+  const tokenChecker = tokenStart < 0
+    ? ''
+    : tokenRest.slice(0, tokenEnd < 0 ? tokenRest.length : tokenEnd).join('\n');
+  if (!tokenChecker.includes(`rpc_url = "${heliusUrl}"`)) {
+    throw new Error('token_checker_not_migrated_to_spam_rpc');
   }
 
   const asserted = await run(process.execPath, [assertion, configPath]);

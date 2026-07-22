@@ -61,7 +61,7 @@ try {
   await writeFile(join(directory, 'fixture-keypair.json'), '[]\n', 'utf8');
 
   // The v1.1.2 ordinary-RPC profile is a [[spam_rpc]] paired with
-  // spam_senders. Its token-account checker remains on the normal read RPC.
+  // spam_senders. Its token-account checker uses the same indexed Helius URL.
   // threads=0 selects NotArb's dynamic cached executor thread pool.
   await expectValid(config);
 
@@ -81,12 +81,12 @@ try {
   );
 
   await expectInvalid(
-    'token_checker_reader_rpc_mismatch',
+    'token_checker_sender_rpc_mismatch',
     config.replace(
       /(\[token_accounts_checker\][\s\S]*?rpc_url\s*=\s*)"[^"\n]+"/,
-      '$1"http://different-reader.invalid:8899"',
+      '$1"https://mainnet.helius-rpc.com/?api-key=other-indexed-key"',
     ),
-    '[token_accounts_checker] rpc_url must be',
+    '[token_accounts_checker] rpc_url must exactly match',
   );
 
   await expectInvalid(

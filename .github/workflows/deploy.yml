@@ -243,7 +243,7 @@ jobs:
           # The deployed JAR is NotArb v1.1.2. Its official distribution uses
           # [[spam_rpc]] plus spam_senders; normalize the known old hybrid
           # before asserting the private config, without printing its secret.
-          /usr/bin/node "$staging/migrate-last-live-config.mjs" "$config" --reader-rpc=http://82.39.215.201:8899
+          /usr/bin/node "$staging/migrate-last-live-config.mjs" "$config"
           LAST_READ_RPC_URL=http://82.39.215.201:8899 /usr/bin/node "$staging/assert-last-live.mjs" "$config"
 
           for name in .last-grpc-state.json .last-route-bridge-state.json .last-notarb-live-supervisor-state.json last-grpc-active-lookup-tables.txt last-grpc-activity.json last-grpc-route.json last-grpc-alt-uses.jsonl last-grpc-events.jsonl last-grpc-rust-runtime.stderr.log last-grpc-rust-runtime.stdout.log last-grpc-summaries.jsonl last-notarb-live-supervisor.stderr.log last-notarb-live-supervisor.stdout.log last-route-rust.stderr.log last-route-rust.stdout.log last-target-lookup-tables.txt last-target-markets.json last-target-route.json last-target-status.json notarb-last-target-live.stderr.log notarb-last-target-live.stdout.log; do

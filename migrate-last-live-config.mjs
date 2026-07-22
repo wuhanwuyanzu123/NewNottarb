@@ -13,12 +13,8 @@ import process from 'node:process';
 
 async function main() {
 const [configPath, ...options] = process.argv.slice(2);
-if (!configPath || options.length > 1 || (options[0] && !options[0].startsWith('--reader-rpc='))) {
-  fail('Usage: node migrate-last-live-config.mjs <live-config.toml> [--reader-rpc=URL]');
-}
-const readerRpc = options[0]?.slice('--reader-rpc='.length) ?? null;
-if (readerRpc && !/^https?:\/\/[^\s]+$/i.test(readerRpc)) {
-  fail('--reader-rpc must be an HTTP(S) URL.');
+if (!configPath || options.length !== 0) {
+  fail('Usage: node migrate-last-live-config.mjs <live-config.toml>');
 }
 
 const original = await readFile(configPath, 'utf8');
@@ -45,12 +41,10 @@ if (executor.value('threads') !== '0') {
   changes.push('transaction_executor_threads');
 }
 
-if (readerRpc) {
-  const tokenChecker = document.exactlyOne('token_accounts_checker');
-  if (tokenChecker.stringValue('rpc_url') !== readerRpc) {
-    tokenChecker.setValue('rpc_url', JSON.stringify(readerRpc));
-    changes.push('token_accounts_checker_reader_rpc');
-  }
+const tokenChecker = document.exactlyOne('token_accounts_checker');
+if (tokenChecker.stringValue('rpc_url') !== spamUrl) {
+  tokenChecker.setValue('rpc_url', JSON.stringify(spamUrl));
+  changes.push('token_accounts_checker_spam_rpc');
 }
 
 const strategy = document.exactlyOne('swap.strategy');

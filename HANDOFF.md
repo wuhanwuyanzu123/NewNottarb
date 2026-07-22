@@ -36,8 +36,10 @@ absent. The current server paths are:
 ```
 
 When deployed, the server connects directly to `82.39.215.201:10000` (gRPC) and
-`82.39.215.201:8899` (read RPC). The blockhash, price, token-account checker,
-market, and ALT loaders stay on that read RPC. For NotArb v1.1.2, `spam1` is
+`82.39.215.201:8899` (read RPC). The blockhash, price, market, and ALT loaders
+stay on that read RPC. The token-account checker matches the indexed Helius
+`[[spam_rpc]]` URL because the 82 read node does not index this bot wallet.
+For NotArb v1.1.2, `spam1` is
 selected through `[[spam_rpc]]` plus
 `spam_senders = [{ rpc = "spam1", ... }]`; it is the single ordinary Helius
 sending endpoint, not a `[[sender]]` / `senders` profile. There are no
@@ -53,9 +55,9 @@ Windows/WSL observer processes or local SSH tunnels in this deployment.
    `/etc/notarb-last/notarb-last-grpc-live.toml` as `root:root`, mode `0600`.
    Start the live TOML from the tracked example, set the bot keypair and
    Helius API key, set `blockhash_updater`, `price_updater`, `market_loader`,
-    `lookup_table_loader`, `token_accounts_checker`, and `grpc_url` to the
-    direct 82.39 endpoints; set only `[[spam_rpc]].url` to the Helius sending
-    endpoint. Keep the markets and ALT paths relative; the live service
+    `lookup_table_loader`, and `grpc_url` to the direct 82.39 endpoints; set
+    `[token_accounts_checker].rpc_url` and `[[spam_rpc]].url` to the same
+    indexed Helius endpoint. Keep the markets and ALT paths relative; the live service
     maintains their stable `/etc/notarb-last` links. Do not commit this file or
     the keypair.
 3. For the first deployment only, place the matching NotArb JAR at
@@ -299,10 +301,9 @@ when the lease becomes quiet, held, stale, or incoherent. Its logs are
 `last-notarb-live-supervisor.stdout.log` and
 `last-notarb-live-supervisor.stderr.log`.
 
-`[token_accounts_checker]` stays on the ordinary 82 read RPC, as in the
-version-matched v1.1.2 example. The Helius endpoint is reserved for the
-`[[spam_rpc]]` transaction sender; the bridge and all reader/load roles remain
-on the 82 read RPC.
+`[token_accounts_checker]` must match the indexed Helius `[[spam_rpc]]` URL.
+The 82 read RPC returns an account-secondary-index error for this bot wallet;
+the bridge and blockhash, price, market, and ALT reader roles remain on 82.
 
 No private material should ever be committed. `.gitignore` excludes the local
 run config, wallet JSON files, event data, logs, and dependencies.

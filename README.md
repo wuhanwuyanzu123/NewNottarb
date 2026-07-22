@@ -29,11 +29,11 @@ services without a local SSH forward:
   -> activity-gated NotArb supervisor
 
 82.39.215.201:8899 read RPC
-  -> Rust pool/ALT validation and all NotArb reader roles, including
-     token_accounts_checker
+  -> Rust pool/ALT validation and NotArb blockhash, price, market, and ALT reads
 
 Helius ordinary JSON-RPC
-  -> live `spam1` `[[spam_rpc]]` transaction sending only
+  -> live `spam1` `[[spam_rpc]]` transaction sending and
+     token_accounts_checker account-index reads
 ```
 
 The deployment templates create `notarb-last-pipeline.service` and
@@ -265,7 +265,7 @@ spam_senders = [{ rpc = "spam1", max_retries = 0 }]
 
 Do not cross this with the distinct `[[sender]]` / `senders` schema. The
 deployment validates the v1.1.2 pair, omits `require_profit`, and preserves
-the ordinary 82 read RPC for non-send roles.
+the ordinary 82 read RPC for blockhash, price, market, and ALT reads.
 
 ```powershell
 Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml
@@ -285,9 +285,10 @@ For NotArb v1.1.2, the ordinary-RPC sender is `[[spam_rpc]] spam1`; do not
 substitute `[[sender]]` / `senders` for this profile.
 `[[swap.strategy]].spam_senders` maps to it with `rpc = "spam1"`, keeps
 `max_retries = 0`, omits `require_profit`, and has no Jito tip. Per the
-version-matched v1.1.2 example, `token_accounts_checker.rpc_url` stays on the
-normal 82.39 read RPC together with the blockhash, price, market, and ALT
-loaders. Priority fees remain capped at 25,000 lamports and the cooldown is
+82.39 does not index this bot wallet for `getTokenAccountsByOwner`, so
+`token_accounts_checker.rpc_url` must match `[[spam_rpc]].url` on Helius;
+blockhash, price, market, and ALT loaders remain on 82.39. Priority fees remain
+capped at 25,000 lamports and the cooldown is
 1,000 ms.
 
 ## Runtime evidence
