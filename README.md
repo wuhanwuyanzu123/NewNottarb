@@ -233,9 +233,11 @@ LAST activity key may launch the next child.
 `notarb-last-grpc-live.example.toml` is the tracked LAST-only live profile.
 Its local runnable copy is ignored by Git. It keeps the global scanner off and
 uses only the bridge-written `last-target-markets.json` plus its exact active
-ALT file. The profile enables one executor, one ordinary Helius JSON-RPC
-sender (`[[spam_rpc]]`, referenced by `spam_senders = [{ rpc = "spam1", ... }]`),
-an enabled SOL strategy, and `flash_loan = true`.
+ALT file. The profile uses `transaction_executor.threads = 0`, which selects
+NotArb v1.1.2's dynamic cached executor thread pool. Its ordinary Helius
+JSON-RPC sender (`[[spam_rpc]]`, referenced by
+`spam_senders = [{ rpc = "spam1", ... }]`), SOL strategy, and `flash_loan = true`
+remain enabled for live execution.
 
 ```powershell
 Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml

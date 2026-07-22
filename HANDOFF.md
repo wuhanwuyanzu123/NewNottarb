@@ -281,11 +281,12 @@ node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
 npm run supervise:last:live
 ```
 
-The profile has `transaction_executor.threads = 1`, one ordinary Helius
+The profile has `transaction_executor.threads = 0`, which selects NotArb
+v1.1.2's dynamic cached executor thread pool. It has one ordinary Helius
 `[[spam_rpc]]` sender selected with `spam_senders = [{ rpc = "spam1", ... }]`
 (the NotArb v1.1.2 ordinary-RPC pair, rather than `[[sender]]` / `senders`), an
-enabled SOL strategy, and
-`[swap.strategy_defaults] flash_loan = true`.
+enabled SOL strategy, and `[swap.strategy_defaults] flash_loan = true`; the
+sender/swap execution path remains enabled.
 It keeps `[notarb_markets] enabled = false`, loading only the current
 `last-target-markets.json` and `last-target-lookup-tables.txt` written by the
 LAST bridge. The profile keeps `require_profit = true`, a 1,000 ms cooldown,

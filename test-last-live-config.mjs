@@ -62,7 +62,14 @@ try {
 
   // The v1.1.2 ordinary-RPC profile is a [[spam_rpc]] paired with
   // spam_senders, and the checker uses the exact same indexed Helius URL.
+  // threads=0 selects NotArb's dynamic cached executor thread pool.
   await expectValid(config);
+
+  await expectInvalid(
+    'executor_enabled',
+    config.replace('threads = 0', 'threads = 1'),
+    '[transaction_executor] threads must be 0',
+  );
 
   await expectInvalid(
     'legacy_senders',

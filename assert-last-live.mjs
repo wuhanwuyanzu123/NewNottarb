@@ -72,7 +72,9 @@ try {
 } catch {
   fail(`[user] keypair_path does not exist: ${keypairPath}`);
 }
-expect(exactlyOne('transaction_executor'), 'threads', '1');
+// In NotArb v1.1.2, zero selects the dynamic cached executor thread pool; it
+// does not disable the enabled sender/swap execution path.
+expect(exactlyOne('transaction_executor'), 'threads', '0');
 expect(exactlyOne('wsol_unwrapper'), 'enabled', 'false');
 const tokenAccounts = exactlyOne('token_accounts_checker');
 const tokenAccountsRpc = stringValue(tokenAccounts, 'rpc_url');

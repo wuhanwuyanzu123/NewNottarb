@@ -34,7 +34,9 @@ rpc_url = "http://127.0.0.1:18899"
 rpc_url = "http://127.0.0.1:18899"
 
 [transaction_executor]
-threads = 1
+# NotArb v1.1.2: 0 selects the dynamic cached executor thread pool; it does
+# not disable the enabled sender/swap execution path.
+threads = 0
 
 [[lookup_tables_file]]
 enabled = true
