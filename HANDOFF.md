@@ -4,6 +4,148 @@ This guide is enough to reproduce the current dry-run and activity-gated live
 profiles from a clean clone. It deliberately does not include a wallet or SSH
 private key.
 
+## 2026-07-22 current handoff: NA instruction-scoped market pairs
+
+**Code baseline before this document:** `136ea35 Restrict LAST pools to NA
+instruction accounts`, pushed to
+`origin/codex/last-activity-lifecycle`. This section records the exact resume
+point; the remainder of this file contains the clone, deployment, and runtime
+procedures.
+
+### What changed and why
+
+NotArb does not accept a target mint or a DEX name as a `markets_file` input.
+It expects a two-dimensional group of concrete pool/market-state addresses:
+
+```toml
+[[markets_file]]
+path = "last-target-markets.json"
+
+[[lookup_tables_file]]
+path = "last-target-lookup-tables.txt"
+```
+
+The target mint and DEX are bridge constraints used to identify and validate
+the correct pool-state accounts. They are not a substitute for the market
+addresses. A full Solana transaction account list is too broad: it can contain
+unrelated accounts, accounts from another leg, and addresses loaded from an
+ALT. The reliable route-local boundary is the account-meta vector of the outer
+`NA247a7YE9S3p9CdKmMyETx8TTwbSdVbVYHHxpnHTUV` instruction.
+
+`136ea35` therefore makes these two coordinated changes:
+
+1. `grpc-last.mjs` records every top-level NotArb instruction in
+   `notArb.instructions[]`, with each expanded account's instruction-relative
+   `position`, global `accountIndex`, `pubkey`, `source` (`transaction` or
+   `lookup_table`), `writable`, and `signer` fields.
+2. `rust/last-route-bridge/src/main.rs` takes pool candidates from those
+   NotArb instruction accounts first, then confirms them through the read RPC
+   using DEX owner, supported binary layout, target mint, and WSOL checks.
+   It writes `poolCandidateSource: "na_instruction_accounts"` and a
+   `naInstructionReferences` array on every emitted
+   `validatedPoolStates[]` item in `last-target-route.json`.
+
+This deliberately preserves the whole NA account vector rather than
+hard-coding an absolute account-key number. On a checked historical route, the
+pool states occurred at NA-instruction-relative positions `10`, `20`, `40`,
+and `50`; their global message indexes and ALT placement vary with the DEX
+legs. The observed positions follow DEX-program / pool-state adjacency, but
+that is evidence rather than an ABI rule to hard-code.
+
+### Compatibility caveat
+
+Old persisted receipts predate `notArb.instructions[]`. For those receipts
+only, the bridge retains `poolCandidateSource: "legacy_transaction_accounts"`
+and falls back to the complete transaction account list so old local evidence
+remains readable. Treat that output as
+historical compatibility evidence, not proof that the NA-scoped path works.
+The next fresh gRPC receipt must produce
+`poolCandidateSource: "na_instruction_accounts"`; if it does not, retain the
+route as `held` and investigate the observer receipt rather than accepting a
+new broad candidate set.
+
+### Verified evidence and tests
+
+- Historical LAST route signature:
+  `5P8Y1eNNkw1pqZ86uGgiUoyYqgw7QNaJ4uSq2V8E52xgDe3d23rge8vRCepzmkLLn2moNuh4hKxikhifHi26ceh`.
+- Observed target mint:
+  `7V6Sk63y8Rr1MvcN5mYNp61wgFhy4EeQg5gUASk9pump`.
+- Verified route protocols: Pump.fun AMM, Meteora DLMM, and Meteora CPMM.
+  Example checked pool states are `9fXLKzhn5YGHYTVx1Rnm8fYPnwm2oV415ewztciKN5EE`
+  (DLMM, 904 bytes),
+  `AakC3joD4NEYmwXc6by5xmtVcxbZBrBJW4FCWxZBoGj7` (DLMM, 904 bytes),
+  `EDX18gJCdijqSLAJA2pp5C2VmA3bTRrx4utxkeJuFRtQ` (Pump, 301 bytes), and
+  `Gov3BLH9edvuSrSLj4a74ExM7KBrYQ2Z2eAsYff2bLuE` (CPMM, 1112 bytes).
+- The current change passed `node --check grpc-last.mjs`, `git diff --check`,
+  Rust `cargo fmt --check`, and all 18 locked Rust tests.
+
+### Runtime status at handoff
+
+There is no recorded real `sendTransaction` signature at this handoff point.
+The most recent retained LAST route had exceeded its activity lease, so the
+bridge status was `held` with `observer_stale`; an absent NotArb child in that
+state is expected. A `No arbitrage profit found` log is still useful route
+intent evidence, but it is not an executed fill or a realized price.
+
+The deployed baseline before `136ea35` was `ecaf38a` at
+`/opt/notarb-last/releases/ecaf38ab8aeccc0d08f193afd84a36964f8010d6` on
+`82.23.138.51`. The new commit is pushed but must be treated as deployed only
+after its GitHub Actions run succeeds and `/opt/notarb-last/current` resolves
+to its release. The runtime itself is on `82.23.138.51`; it directly reads
+Yellowstone from `82.39.215.201:10000` and the read RPC from
+`82.39.215.201:8899`.
+
+### Resume checklist after a fresh LAST event
+
+1. Pull `codex/last-activity-lifecycle`, install dependencies with
+   `npm ci --ignore-scripts`, and run:
+
+   ```powershell
+   npm run test:last:live-config
+   npm run test:last:live-config-migration
+   npm run test:last:bridge
+   wsl.exe -d Ubuntu --cd /mnt/g/old-program/notarb/rust/last-route-bridge cargo test --locked
+   ```
+
+2. After CI deployment, confirm the release and both services without exposing
+   private TOML or key material:
+
+   ```bash
+   readlink -f /opt/notarb-last/current
+   systemctl is-active notarb-last-pipeline.service notarb-last-live-supervisor.service
+   ```
+
+3. When a new observer event arrives, inspect
+   `/var/lib/notarb-last/runtime-state/last-target-route.json`. Require all of
+   the following before treating it as a usable current route:
+
+   - `poolCandidateSource == "na_instruction_accounts"`;
+   - each selected pool has one or more `naInstructionReferences`;
+   - the target status is `active`, its signature/generation matches the
+     observer state, and the market file contains the same group;
+   - all selected ALT IDs are readable and appear in
+     `last-target-lookup-tables.txt`.
+
+4. Only during that fresh active lease should the live supervisor create the
+   NotArb child. Follow the current logs:
+
+   ```bash
+   tail -F /var/lib/notarb-last/runtime-state/last-grpc-rust-runtime.stderr.log \
+           /var/lib/notarb-last/runtime-state/last-route-rust.stderr.log \
+           /var/lib/notarb-last/runtime-state/notarb-last-target-live.stderr.log
+   ```
+
+   Record the Helius transaction signature only if the sender actually returns
+   one. A running Java process, `[markets_file] Groups: 1`, or an active route
+   alone does not establish that a transaction was sent.
+
+5. If the old token-account `-32010` error returns, verify that only
+   `[token_accounts_checker]` and `[[spam_rpc]]` use the indexed Helius URL;
+   leave blockhash, price, market, and ALT readers on the 82 read RPC. The
+   live profile uses `[[spam_rpc]]` plus `spam_senders`, omits
+   `require_profit`, has no Jito tip, and uses `threads = 0` as NotArb's
+   dynamic executor setting.
+
 ## 82.23.138.51 deployment target
 
 The production target is `root@82.23.138.51`, not the Windows workstation.
