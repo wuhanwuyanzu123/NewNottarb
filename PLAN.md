@@ -5,14 +5,14 @@
 - A standalone Yellowstone gRPC observer tracks `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through the 82 endpoint.
 - The observer keeps no-profit NotArb checks as arbitrage-intent evidence: mint, intended DEX programs, ALT tables, and a distinct `not_executed` price status.
 - The observed public ALT IDs are stored in `last-grpc-active-lookup-tables.txt`.
-- `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file` and route-specific ALT file; it verifies DEX account owner/pool-state size and excludes unreadable ALT accounts through the 82 read-RPC tunnel before using an address.
+- `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file` and route-specific ALT file; it derives market-state addresses from the outer NA instruction's DEX-program offsets, verifies expected owner/layout, and excludes unreadable ALT accounts through the 82 read-RPC tunnel before using an address.
 - The observer normalizes route fingerprints to suppress account-order noise while retaining writable route accounts, and the bridge switches generations only when the validated mint/DEX/pool/ALT set actually changes.
 - The active target is intentionally dynamic. Read `last-target-route.json` together with `last-target-status.json` rather than hard-coding a historical mint or pool group.
 - NotArb `onchain-bot` loads only that target-specific `markets_file`; the global `[notarb_markets]` scan is disabled. The dry-run profile keeps all sender and executor paths off.
 - `last-notarb-supervisor.mjs` owns the lifecycle for both the dry-run and live profiles: it starts one child only after current LAST route activity is bridge-validated, and stops that child after 30 seconds of quiet activity or on any held/stale/mismatched local evidence. The observer records dedicated `lastRoute*` activity fields so unrelated LAST transactions cannot start the child.
 - The direct target-runner wrapper is supervisor-internal and receives the same explicitly passed TOML that the supervisor validates; it rejects a direct launch rather than leaving a quiet-period bot running.
 - `notarb-last-grpc-live.example.toml`, `assert-last-live.mjs`, and the live wrappers provide a local ignored ordinary-Helius-RPC sender profile with `transaction_executor.threads = 0` (NotArb v1.1.2's dynamic cached executor thread pool), an enabled SOL strategy, and `flash_loan = true`; the sender/swap execution path remains enabled.
-- `rust/last-route-bridge` is a compiled Linux route bridge. It owns the compact route lease, validates the same target-only pools/ALTs through `LAST_READ_RPC_URL`, includes Orca Whirlpool's 653-byte pool layout, and publishes `held/no_route_evidence` without an RPC call before the first qualified event.
+- `rust/last-route-bridge` is a compiled Linux route bridge. It owns the compact route lease, validates each outer NA instruction's ordered market-state group and ALTs through `LAST_READ_RPC_URL`, includes Orca Whirlpool's 653-byte market layout, and publishes `held/no_route_evidence` without an RPC call before the first qualified event.
 - When the validated market generation is unchanged but a new LAST route check has different ALT indexes or writable account metas, the Rust bridge refreshes the route-evidence fingerprint before publishing the renewed active lease. This keeps the observer, route record, and supervisor coherent without creating a duplicate generation.
 - The supervisor uses local status/markets file mtimes, not WSL payload timestamps, for a 20-second markets heartbeat and activity freshness; `held` and stale route status still end the child lease immediately.
 - A lifecycle activation key combines generation and LAST signature. The supervisor never relaunches a stopped/failed child for that same key after a transient publication gap; the next fresh validated signature is required for another child.
@@ -56,7 +56,7 @@ systemd: notarb-last-live-supervisor.service
 ## Evidence boundary
 
 - A `No arbitrage profit found` transaction is route-intent evidence only. It
-  can supply candidate mint/DEX/pool/ALT inputs for dry-run, but it is not an
+  can supply candidate mint/DEX/market/ALT inputs for dry-run, but it is not an
   executed DEX CPI and does not supply a realized price.
 - A retained historical group is evidence only. The supervisor treats it as
   ineligible until `.last-grpc-state.json.lastRouteObservedAt` is fresh and the
@@ -66,7 +66,7 @@ systemd: notarb-last-live-supervisor.service
   `rejectedLookupTables` is evidence only and is never loaded.
 - `last-target-status.json` is the authoritative automatic-follow result. A
   `held` result keeps the previous target group and reports unsupported DEX,
-  unreadable ALT, insufficient validated pools, or a stale observer; it never
+  unreadable ALT, insufficient validated markets, or a stale observer; it never
   replaces a known group with arbitrary account keys.
 
 ## Live profile inputs

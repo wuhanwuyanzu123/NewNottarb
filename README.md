@@ -3,7 +3,7 @@
 This project follows the observed route of one address, not the whole chain:
 
 1. `grpc-last.mjs` watches `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through Yellowstone gRPC.
-2. The compiled `rust/last-route-bridge` validates DEX-owned pool-state accounts from those LAST transactions through the read RPC and writes a NotArb `markets_file` plus a route-specific ALT file.
+2. The compiled `rust/last-route-bridge` derives DEX-owned market-state accounts from the outer NotArb instruction's relative positions, validates them through the read RPC, and writes a NotArb `markets_file` plus a route-specific ALT file.
 3. `last-notarb-supervisor.mjs` starts the selected target-only NotArb profile
    only during a fresh, bridge-validated LAST activity window, and stops its
    own child tree when the window closes. The global `[notarb_markets]` stream
@@ -29,7 +29,7 @@ services without a local SSH forward:
   -> activity-gated NotArb supervisor
 
 82.39.215.201:8899 read RPC
-  -> Rust pool/ALT validation and NotArb blockhash, price, market, and ALT reads
+  -> Rust market-state/ALT validation and NotArb blockhash, price, market, and ALT reads
 
 Helius ordinary JSON-RPC
   -> live `spam1` `[[spam_rpc]]` transaction sending and
@@ -87,9 +87,9 @@ not start NotArb or a transaction sender.
 It emits ignored runtime files:
 
 - `last-target-route.json` — the LAST signature, target mint, candidate DEXes,
-  and validated pool-state evidence.
-- `last-target-markets.json` — a NotArb `markets_file` containing only direct
-  pool states from the observed LAST route.
+  and validated market-state evidence.
+- `last-target-markets.json` — a NotArb `markets_file` containing the exact
+  market-state group from each validated outer NotArb instruction.
 - `last-target-lookup-tables.txt` contains only the currently readable public
   ALT IDs from that selected LAST route, not an accumulated historical ALT
   list.
@@ -100,19 +100,32 @@ It emits ignored runtime files:
 ### Automatic route rotation
 
 There is no fixed target mint in the NotArb config. When LAST changes mint,
-validated pool set, DEX set, or ALT selection, the gRPC observer writes a new
-route snapshot. The bridge normalizes account ordering, validates the new
-pool-state accounts and ALT tables through `127.0.0.1:18899`, then atomically
-replaces each target file only when the complete route is usable. NotArb polls
-the market file every 15 seconds and the ALT file every 30 seconds.
+validated market set, DEX set, or ALT selection, the gRPC observer writes a
+new route snapshot. For every outer NotArb instruction, the bridge finds each
+supported DEX program and takes its instruction-relative market-state account
+(`+1` for Raydium, Pump, DLMM, and Orca; `+2` for Meteora CPMM), then validates
+owner and binary layout through `127.0.0.1:18899`. It preserves that NA route
+order in one NotArb group and atomically replaces each target file only when
+the complete route is usable. NotArb polls the market file every 15 seconds
+and the ALT file every 30 seconds.
+
+The generated JSON uses NotArb's documented object form:
+
+```json
+{
+  "update_timestamp": 1706540400000,
+  "groups": [["market-state-1", "market-state-2"]]
+}
+```
 
 The bridge is deliberately fail-closed: an unsupported candidate DEX, an
-unreadable route ALT, or fewer than two validated pools leaves the prior target
-group in place and writes `status: "held"` with the reason instead of loading
-unverified accounts. Current automatic pool layouts cover Pump.fun AMM,
-Meteora DLMM/CPMM, and Raydium AMM v4. A newly observed protocol is surfaced
-in `unsupportedCandidateDexPrograms`; it must receive an explicit verified
-pool layout before it can be loaded.
+unreadable route ALT, a missing/invalid NA market-state, or fewer than two
+validated markets leaves the prior target group in place and writes
+`status: "held"` with the reason instead of loading unverified accounts.
+Current automatic market layouts cover Pump.fun AMM, Meteora DLMM/CPMM,
+Raydium AMM v4, and Orca Whirlpool. A newly observed protocol is surfaced in
+`unsupportedCandidateDexPrograms`; it must receive an explicit verified market
+layout before it can be loaded.
 
 A retained group is evidence only while the watcher is quiet. The lifecycle
 supervisor requires fresh route activity plus a matching `active` bridge status
@@ -200,7 +213,7 @@ The template is deliberately non-live:
 The production route bridge is Linux-compatible and runs in the 82.23 pipeline.
 It reads the local gRPC JSONL evidence, uses `LAST_READ_RPC_URL` for account
 and ALT validation, writes the target route lease, and supports Orca Whirlpool
-pool states (`653` bytes) in addition to the existing Pump, Meteora, and
+market states (`653` bytes) in addition to the existing Pump, Meteora, and
 Raydium layouts. The deployed value is `http://82.39.215.201:8899`.
 
 For local WSL development, run the Linux pipeline only after stopping any

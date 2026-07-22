@@ -25,11 +25,11 @@ path = "last-target-markets.json"
 path = "last-target-lookup-tables.txt"
 ```
 
-The target mint and DEX are bridge constraints used to identify and validate
-the correct pool-state accounts. They are not a substitute for the market
-addresses. A full Solana transaction account list is too broad: it can contain
-unrelated accounts, accounts from another leg, and addresses loaded from an
-ALT. The reliable route-local boundary is the account-meta vector of the outer
+The target mint and DEX are bridge constraints used to validate market-state
+accounts. They are not a substitute for the market addresses. A full Solana
+transaction account list is too broad: it can contain unrelated accounts,
+accounts from another leg, and addresses loaded from an ALT. The reliable
+route-local boundary is the account-meta vector of the outer
 `NA247a7YE9S3p9CdKmMyETx8TTwbSdVbVYHHxpnHTUV` instruction.
 
 `136ea35` therefore makes these two coordinated changes:
@@ -38,31 +38,37 @@ ALT. The reliable route-local boundary is the account-meta vector of the outer
    `notArb.instructions[]`, with each expanded account's instruction-relative
    `position`, global `accountIndex`, `pubkey`, `source` (`transaction` or
    `lookup_table`), `writable`, and `signer` fields.
-2. `rust/last-route-bridge/src/main.rs` takes pool candidates from those
-   NotArb instruction accounts first, then confirms them through the read RPC
-   using DEX owner, supported binary layout, target mint, and WSOL checks.
-   It writes `poolCandidateSource: "na_instruction_accounts"` and a
-   `naInstructionReferences` array on every emitted
-   `validatedPoolStates[]` item in `last-target-route.json`.
+2. `rust/last-route-bridge/src/main.rs` scans those accounts for a supported
+   DEX program and takes only its market-state account at the verified
+   instruction-relative offset: `+1` for Raydium AMM v4, Pump AMM, Meteora
+   DLMM, and Orca Whirlpool; `+2` for Meteora CPMM (the skipped `+1` account
+   is its event authority). It confirms the expected DEX owner and binary
+   layout through the read RPC. Every validated outer NA instruction becomes
+   one NotArb `groups[]` entry in its original market order; it is not reduced
+   to a target-mint or WSOL-only subset. The route record writes
+   `marketCandidateSource: "na_instruction_market_pairs"`,
+   `validatedMarketStates[]`, and a `naInstructionReferences` array with the
+   DEX-program and market positions. The older `pool*` fields remain aliases
+   for inspection compatibility.
 
-This deliberately preserves the whole NA account vector rather than
-hard-coding an absolute account-key number. On a checked historical route, the
-pool states occurred at NA-instruction-relative positions `10`, `20`, `40`,
-and `50`; their global message indexes and ALT placement vary with the DEX
-legs. The observed positions follow DEX-program / pool-state adjacency, but
-that is evidence rather than an ABI rule to hard-code.
+This deliberately uses instruction-relative positions rather than an absolute
+message account-key number. On a checked historical route, market states
+occurred at positions `10`, `20`, `40`, and `50`; another route can use
+`10`, `18`, `27`, `36`, `44`, and `49`. Global message indexes and ALT
+placement vary with the DEX legs. The protocol-specific program-to-market
+offset is the verified rule; absolute positions are only route evidence.
 
 ### Compatibility caveat
 
 Old persisted receipts predate `notArb.instructions[]`. For those receipts
-only, the bridge retains `poolCandidateSource: "legacy_transaction_accounts"`
-and falls back to the complete transaction account list so old local evidence
-remains readable. Treat that output as
+only, the bridge retains a `marketCandidateSource` value of
+`legacy_transaction_accounts` and falls back to the complete transaction
+account list so old local evidence remains readable. Treat that output as
 historical compatibility evidence, not proof that the NA-scoped path works.
 The next fresh gRPC receipt must produce
-`poolCandidateSource: "na_instruction_accounts"`; if it does not, retain the
-route as `held` and investigate the observer receipt rather than accepting a
-new broad candidate set.
+`marketCandidateSource: "na_instruction_market_pairs"`; if it does not,
+retain the route as `held` and investigate the observer receipt rather than
+accepting a new broad candidate set.
 
 ### Verified evidence and tests
 
@@ -76,8 +82,8 @@ new broad candidate set.
   `AakC3joD4NEYmwXc6by5xmtVcxbZBrBJW4FCWxZBoGj7` (DLMM, 904 bytes),
   `EDX18gJCdijqSLAJA2pp5C2VmA3bTRrx4utxkeJuFRtQ` (Pump, 301 bytes), and
   `Gov3BLH9edvuSrSLj4a74ExM7KBrYQ2Z2eAsYff2bLuE` (CPMM, 1112 bytes).
-- The current change passed `node --check grpc-last.mjs`, `git diff --check`,
-  Rust `cargo fmt --check`, and all 18 locked Rust tests.
+- The current change passes `node --check grpc-last.mjs`, `git diff --check`,
+  Rust `cargo fmt --check`, and the locked Rust test suite in CI.
 
 ### Runtime status at handoff
 
@@ -119,8 +125,9 @@ Yellowstone from `82.39.215.201:10000` and the read RPC from
    `/var/lib/notarb-last/runtime-state/last-target-route.json`. Require all of
    the following before treating it as a usable current route:
 
-   - `poolCandidateSource == "na_instruction_accounts"`;
-   - each selected pool has one or more `naInstructionReferences`;
+   - `marketCandidateSource == "na_instruction_market_pairs"`;
+   - each selected market has one or more `naInstructionReferences`, including
+     its DEX-program position, market position, and protocol offset;
    - the target status is `active`, its signature/generation matches the
      observer state, and the market file contains the same group;
    - all selected ALT IDs are readable and appear in

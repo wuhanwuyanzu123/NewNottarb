@@ -4,7 +4,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
     io::Write,
@@ -30,6 +30,10 @@ struct PoolLayout {
     program_id: &'static str,
     label: &'static str,
     sizes: &'static [usize],
+    // The NotArb instruction supplies a DEX program followed by the concrete
+    // market-state account that NotArb expects in markets_file. CPMM has an
+    // event-authority account between those two entries.
+    market_offset: u64,
 }
 
 const POOL_LAYOUTS: &[PoolLayout] = &[
@@ -37,27 +41,32 @@ const POOL_LAYOUTS: &[PoolLayout] = &[
         program_id: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
         label: "Raydium AMM v4",
         sizes: &[752],
+        market_offset: 1,
     },
     PoolLayout {
         program_id: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
         label: "Pump.fun AMM",
         sizes: &[301],
+        market_offset: 1,
     },
     PoolLayout {
         program_id: "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
         label: "Meteora CPMM",
         sizes: &[1112],
+        market_offset: 2,
     },
     PoolLayout {
         program_id: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         label: "Meteora DLMM",
         sizes: &[904],
+        market_offset: 1,
     },
     // Orca Whirlpool::LEN is 653 bytes (including Anchor discriminator).
     PoolLayout {
         program_id: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
         label: "Orca Whirlpool",
         sizes: &[653],
+        market_offset: 1,
     },
 ];
 
@@ -82,6 +91,31 @@ struct Pool {
     data_len: usize,
     target_mints: Vec<String>,
     contains_wsol: bool,
+    instruction_index: Option<u64>,
+    dex_program_position: Option<u64>,
+    market_position: Option<u64>,
+    market_offset: Option<u64>,
+}
+
+// A market candidate is tied to the instruction-relative DEX position that
+// selected it. The global message account index is deliberately not used:
+// ALT placement makes it unstable across otherwise identical routes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarketCandidate {
+    address: String,
+    expected_program_id: Option<String>,
+    instruction_index: Option<u64>,
+    dex_program_position: Option<u64>,
+    market_position: Option<u64>,
+    market_offset: Option<u64>,
+    account_index: Option<u64>,
+    source: Option<String>,
+    writable: bool,
+}
+
+struct CandidateMarkets {
+    source: &'static str,
+    candidates: Vec<MarketCandidate>,
 }
 
 #[derive(Clone)]
@@ -683,14 +717,25 @@ fn rpc_accounts(rpc_url: &str, addresses: &[String]) -> Result<Vec<Account>> {
     Ok(accounts)
 }
 
-// A pool used by an NA route must be passed to the outer NA instruction for
-// its downstream CPI.  Prefer that instruction's expanded account metas over
-// the complete transaction account list: a transaction can carry unrelated
-// accounts or even another route.  Older persisted receipts did not retain
-// these metas, so retain the account-key fallback only for backwards
-// compatibility until the next live gRPC receipt arrives.
-fn na_instruction_account_addresses(event: &Value) -> Vec<String> {
-    let mut values = BTreeSet::new();
+fn instruction_position(account: &Value) -> Option<u64> {
+    account.get("position").and_then(Value::as_u64)
+}
+
+fn has_na_instruction_vector(event: &Value) -> bool {
+    event
+        .get("notArb")
+        .and_then(|value| value.get("instructions"))
+        .and_then(Value::as_array)
+        .is_some()
+}
+
+// The markets_file is not a list of every account used by a DEX CPI. It must
+// contain the concrete market-state account for each DEX leg. Preserve the
+// outer NA instruction's relative positions and derive exactly those accounts
+// from the DEX program's verified offset. A fresh expanded NA vector must not
+// silently fall back to the broad transaction account list.
+fn na_instruction_market_candidates(event: &Value) -> Vec<MarketCandidate> {
+    let mut candidates = Vec::new();
     for instruction in event
         .get("notArb")
         .and_then(|value| value.get("instructions"))
@@ -698,25 +743,80 @@ fn na_instruction_account_addresses(event: &Value) -> Vec<String> {
         .into_iter()
         .flatten()
     {
-        for account in instruction
-            .get("accounts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(address) = account.get("pubkey").and_then(Value::as_str) {
-                values.insert(address.to_owned());
+        let instruction_index = instruction.get("index").and_then(Value::as_u64);
+        let Some(accounts) = instruction.get("accounts").and_then(Value::as_array) else {
+            continue;
+        };
+        for program_account in accounts {
+            let Some(program_id) = program_account.get("pubkey").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(layout) = find_layout(program_id) else {
+                continue;
+            };
+            let Some(dex_program_position) = instruction_position(program_account) else {
+                continue;
+            };
+            let Some(market_position) = dex_program_position.checked_add(layout.market_offset)
+            else {
+                continue;
+            };
+            let Some(market_account) = accounts
+                .iter()
+                .find(|account| instruction_position(account) == Some(market_position))
+            else {
+                continue;
+            };
+            let Some(address) = market_account.get("pubkey").and_then(Value::as_str) else {
+                continue;
+            };
+            // All observed NotArb market-state accounts are writable. Requiring
+            // that flag rejects an event authority, program, or read-only meta
+            // that happens to occupy a nearby position.
+            if market_account.get("writable").and_then(Value::as_bool) != Some(true) {
+                continue;
             }
+            candidates.push(MarketCandidate {
+                address: address.to_owned(),
+                expected_program_id: Some(program_id.to_owned()),
+                instruction_index,
+                dex_program_position: Some(dex_program_position),
+                market_position: Some(market_position),
+                market_offset: Some(layout.market_offset),
+                account_index: market_account.get("accountIndex").and_then(Value::as_u64),
+                source: market_account
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                writable: true,
+            });
         }
     }
-    values.into_iter().collect()
+    candidates.sort_by(|left, right| {
+        left.instruction_index
+            .cmp(&right.instruction_index)
+            .then(left.market_position.cmp(&right.market_position))
+            .then(left.address.cmp(&right.address))
+    });
+    candidates.dedup_by(|left, right| {
+        left.instruction_index == right.instruction_index
+            && left.market_position == right.market_position
+            && left.address == right.address
+    });
+    candidates
 }
 
-fn pool_candidate_addresses(event: &Value) -> (Vec<String>, &'static str) {
-    let instruction_accounts = na_instruction_account_addresses(event);
-    if !instruction_accounts.is_empty() {
-        return (instruction_accounts, "na_instruction_accounts");
+fn market_candidates(event: &Value) -> CandidateMarkets {
+    if has_na_instruction_vector(event) {
+        return CandidateMarkets {
+            source: "na_instruction_market_pairs",
+            candidates: na_instruction_market_candidates(event),
+        };
     }
+
+    // Old persisted receipts predate notArb.instructions[]. Keep the broad
+    // account-key fallback solely so historical evidence remains readable;
+    // it is never used when a fresh NA account vector is available.
     let mut values = BTreeSet::new();
     for key in event
         .get("accountKeys")
@@ -728,40 +828,49 @@ fn pool_candidate_addresses(event: &Value) -> (Vec<String>, &'static str) {
             values.insert(address.to_owned());
         }
     }
-    (values.into_iter().collect(), "legacy_transaction_accounts")
-}
-
-fn na_instruction_references(event: &Value, address: &str) -> Vec<Value> {
-    let mut references = Vec::new();
-    for instruction in event
-        .get("notArb")
-        .and_then(|value| value.get("instructions"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        for account in instruction
-            .get("accounts")
-            .and_then(Value::as_array)
+    CandidateMarkets {
+        source: "legacy_transaction_accounts",
+        candidates: values
             .into_iter()
-            .flatten()
-        {
-            if account.get("pubkey").and_then(Value::as_str) != Some(address) {
-                continue;
-            }
-            references.push(json!({
-                "topLevelInstructionIndex":instruction.get("index").cloned().unwrap_or(Value::Null),
-                "accountPosition":account.get("position").cloned().unwrap_or(Value::Null),
-                "accountIndex":account.get("accountIndex").cloned().unwrap_or(Value::Null),
-                "source":account.get("source").cloned().unwrap_or(Value::Null),
-                "writable":account.get("writable").cloned().unwrap_or(Value::Null),
-            }));
-        }
+            .map(|address| MarketCandidate {
+                address,
+                expected_program_id: None,
+                instruction_index: None,
+                dex_program_position: None,
+                market_position: None,
+                market_offset: None,
+                account_index: None,
+                source: None,
+                writable: false,
+            })
+            .collect(),
     }
-    references
 }
 
-fn route_pools(event: &Value, accounts: &[Account]) -> Result<Vec<Pool>> {
+fn na_instruction_market_references(event: &Value, address: &str) -> Vec<Value> {
+    na_instruction_market_candidates(event)
+        .into_iter()
+        .filter(|candidate| candidate.address == address)
+        .map(|candidate| {
+            json!({
+                "topLevelInstructionIndex":candidate.instruction_index,
+                "dexProgramId":candidate.expected_program_id,
+                "dexProgramPosition":candidate.dex_program_position,
+                "marketPosition":candidate.market_position,
+                "marketOffset":candidate.market_offset,
+                "accountIndex":candidate.account_index,
+                "source":candidate.source,
+                "writable":candidate.writable,
+            })
+        })
+        .collect()
+}
+
+fn route_pools(
+    event: &Value,
+    candidates: &[MarketCandidate],
+    accounts: &[Account],
+) -> Result<Vec<Pool>> {
     let targets = candidate_mints(event)
         .into_iter()
         .map(|mint| {
@@ -773,10 +882,17 @@ fn route_pools(event: &Value, accounts: &[Account]) -> Result<Vec<Pool>> {
         .collect::<Result<Vec<_>>>()?;
     let wsol = bs58::decode(WSOL_MINT).into_vec().context("base58 WSOL")?;
     let mut pools = Vec::new();
-    for account in accounts {
+    for (candidate, account) in candidates.iter().zip(accounts) {
         let Some(owner) = account.owner.as_deref() else {
             continue;
         };
+        if candidate
+            .expected_program_id
+            .as_deref()
+            .is_some_and(|expected| expected != owner)
+        {
+            continue;
+        }
         let Some(layout) = find_layout(owner) else {
             continue;
         };
@@ -791,7 +907,12 @@ fn route_pools(event: &Value, accounts: &[Account]) -> Result<Vec<Pool>> {
             .filter(|(_, mint_bytes)| contains(data, mint_bytes))
             .map(|(mint, _)| mint.clone())
             .collect::<Vec<_>>();
-        if target_mints.is_empty() {
+        // A fresh NA instruction defines the complete NotArb route group.
+        // Include a verified market-state even when it is an intermediate
+        // WSOL-USDC or target-USDC leg and therefore does not contain the
+        // route's headline target mint. The historical fallback retains the
+        // former target-mint gate because it has no instruction-local proof.
+        if target_mints.is_empty() && candidate.instruction_index.is_none() {
             continue;
         }
         pools.push(Pool {
@@ -801,6 +922,10 @@ fn route_pools(event: &Value, accounts: &[Account]) -> Result<Vec<Pool>> {
             data_len: data.len(),
             target_mints,
             contains_wsol: contains(data, &wsol),
+            instruction_index: candidate.instruction_index,
+            dex_program_position: candidate.dex_program_position,
+            market_position: candidate.market_position,
+            market_offset: candidate.market_offset,
         });
     }
     Ok(pools)
@@ -810,7 +935,53 @@ fn contains(data: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && data.windows(needle.len()).any(|window| window == needle)
 }
 
-fn market_groups(targets: &[String], pools: &[Pool], max_markets: usize) -> Vec<Vec<String>> {
+fn na_instruction_market_groups(pools: &[Pool]) -> Vec<Vec<String>> {
+    let mut by_instruction = BTreeMap::<u64, Vec<&Pool>>::new();
+    for pool in pools {
+        let Some(instruction_index) = pool.instruction_index else {
+            continue;
+        };
+        by_instruction
+            .entry(instruction_index)
+            .or_default()
+            .push(pool);
+    }
+    by_instruction
+        .into_values()
+        .filter_map(|mut markets| {
+            // Preserve the exact route order from the NA instruction rather
+            // than alphabetizing addresses or re-filtering on WSOL. NotArb
+            // expects a complete group of concrete market-state accounts.
+            markets.sort_by(|left, right| {
+                left.market_position
+                    .cmp(&right.market_position)
+                    .then(left.address.cmp(&right.address))
+            });
+            let mut seen = BTreeSet::new();
+            let addresses = markets
+                .into_iter()
+                .filter_map(|market| {
+                    seen.insert(market.address.clone())
+                        .then(|| market.address.clone())
+                })
+                .collect::<Vec<_>>();
+            (addresses.len() >= 2).then_some(addresses)
+        })
+        .collect()
+}
+
+fn market_groups(
+    source: &str,
+    targets: &[String],
+    pools: &[Pool],
+    max_markets: usize,
+) -> Vec<Vec<String>> {
+    if source == "na_instruction_market_pairs" {
+        return na_instruction_market_groups(pools);
+    }
+    // Compatibility only for historical receipts that lack the expanded NA
+    // instruction vector. Fresh route output always takes the exact branch
+    // above and never applies the target-mint/WSOL heuristic.
     let mut groups = Vec::new();
     for target in targets {
         let mut candidates = pools
@@ -896,6 +1067,13 @@ fn read_json_if_present(path: &Path) -> Result<Option<Value>> {
 fn write_json_atomically(path: &Path, value: &Value) -> Result<()> {
     let text = format!("{}\n", serde_json::to_string_pretty(value)?);
     write_text_atomically(path, &text)
+}
+
+// NotArb's documented JSON markets_file object. Keep the route group as a
+// two-dimensional array and refresh its timestamp whenever the active lease is
+// renewed so NotArb can reject stale input safely.
+fn notarb_markets_file(groups: Value) -> Value {
+    json!({"update_timestamp":now_ms(),"groups":groups})
 }
 
 // Deployment exposes generated runtime files through release-local symlinks.
@@ -1001,10 +1179,7 @@ fn heartbeat_active_markets_if_due(options: &Options, cache: &mut BridgeCache) -
             markets_path.display()
         ));
     }
-    write_json_atomically(
-        &markets_path,
-        &json!({"update_timestamp":now_ms(),"groups":groups}),
-    )?;
+    write_json_atomically(&markets_path, &notarb_markets_file(groups))?;
     cache.last_markets_heartbeat = Some(Instant::now());
     Ok(())
 }
@@ -1445,10 +1620,7 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             // Do not regenerate route, ALT, or bridge state from a generic
             // transaction. It merely keeps the exact already-validated group
             // warm for NotArb and refreshes its market-file heartbeat.
-            write_json_atomically(
-                &markets_path,
-                &json!({"update_timestamp":now_ms(),"groups":lease.groups}),
-            )?;
+            write_json_atomically(&markets_path, &notarb_markets_file(lease.groups))?;
             let status = json!({
                 "status":"active",
                 "reason":"last_signer_activity",
@@ -1491,7 +1663,23 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             json!({"unsupportedCandidateDexPrograms":unsupported}),
         );
     }
-    let (addresses, pool_candidate_source) = pool_candidate_addresses(&event);
+    let candidate_markets = market_candidates(&event);
+    if candidate_markets.source == "na_instruction_market_pairs"
+        && candidate_markets.candidates.is_empty()
+    {
+        return hold(
+            "missing_na_market_pairs",
+            json!({
+                "candidateDexPrograms":candidate_dexes(&event),
+                "message":"expanded NA instruction accounts contained no writable supported DEX market-state at its required relative offset",
+            }),
+        );
+    }
+    let addresses = candidate_markets
+        .candidates
+        .iter()
+        .map(|candidate| candidate.address.clone())
+        .collect::<Vec<_>>();
     let accounts = rpc_accounts(&options.rpc_url, &addresses)?;
     let observed_alts = observed_alts(&event);
     let alt_accounts = if observed_alts.is_empty() {
@@ -1501,8 +1689,31 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
     };
     let (lookup_tables, rejected_lookup_tables) = validate_alts(&alt_accounts);
     let targets = candidate_mints(&event);
-    let pools = route_pools(&event, &accounts)?;
-    let groups = market_groups(&targets, &pools, options.max_markets);
+    let pools = route_pools(&event, &candidate_markets.candidates, &accounts)?;
+    if candidate_markets.source == "na_instruction_market_pairs"
+        && pools.len() != candidate_markets.candidates.len()
+    {
+        return hold(
+            "invalid_na_market_pair",
+            json!({
+                "candidateMarketCount":candidate_markets.candidates.len(),
+                "validatedMarketCount":pools.len(),
+                "candidateMarkets":candidate_markets.candidates.iter().map(|candidate| json!({
+                    "address":candidate.address,
+                    "dexProgramId":candidate.expected_program_id,
+                    "dexProgramPosition":candidate.dex_program_position,
+                    "marketPosition":candidate.market_position,
+                    "marketOffset":candidate.market_offset,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    let groups = market_groups(
+        candidate_markets.source,
+        &targets,
+        &pools,
+        options.max_markets,
+    );
     if !rejected_lookup_tables.is_empty() {
         return hold(
             "unreadable_route_alt",
@@ -1514,6 +1725,7 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             "insufficient_validated_pools",
             json!({
                 "validatedPoolCount":pools.len(),
+                "marketCandidateSource":candidate_markets.source,
                 "candidateDexPrograms":candidate_dexes(&event),
                 "observedLookupTables":observed_alts,
             }),
@@ -1548,10 +1760,7 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             &event,
             &route_evidence_fingerprint,
         )?;
-        write_json_atomically(
-            &markets_path,
-            &json!({"update_timestamp":now_ms(),"groups":groups}),
-        )?;
+        write_json_atomically(&markets_path, &notarb_markets_file(json!(groups)))?;
         let status = json!({
             "status":"active",
             "reason":"unchanged",
@@ -1596,6 +1805,20 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
     .join("\n")
         + "\n";
     write_text_atomically(&lookup_path, &lookup_text)?;
+    let validated_markets = pools
+        .iter()
+        .map(|pool| {
+            json!({
+                "address":pool.address,
+                "dexProgramId":pool.program_id,
+                "dex":pool.label,
+                "dataLength":pool.data_len,
+                "targetMints":pool.target_mints,
+                "containsWsol":pool.contains_wsol,
+                "naInstructionReferences":na_instruction_market_references(&event, &pool.address),
+            })
+        })
+        .collect::<Vec<_>>();
     let route = json!({
         "schemaVersion":1,
         "generatedAt":now_iso(),
@@ -1613,16 +1836,13 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
         "observedLookupTables":observed_alts,
         "selectedLookupTables":lookup_tables,
         "rejectedLookupTables":rejected_lookup_tables,
-        "poolCandidateSource":pool_candidate_source,
-        "validatedPoolStates":pools.iter().map(|pool| json!({
-            "address":pool.address,
-            "dexProgramId":pool.program_id,
-            "dex":pool.label,
-            "dataLength":pool.data_len,
-            "targetMints":pool.target_mints,
-            "containsWsol":pool.contains_wsol,
-            "naInstructionReferences":na_instruction_references(&event, &pool.address),
-        })).collect::<Vec<_>>(),
+        "marketCandidateSource":candidate_markets.source,
+        "validatedMarketStates":validated_markets.clone(),
+        // Keep the previous names as a read-only compatibility alias for
+        // existing route-inspection tooling. New consumers should use the
+        // market-state fields above.
+        "poolCandidateSource":candidate_markets.source,
+        "validatedPoolStates":validated_markets,
         "selectedGroups":groups,
         "automation":{
             "mode":"auto_follow",
@@ -1634,10 +1854,7 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
         },
     });
     write_json_atomically(&route_path, &route)?;
-    write_json_atomically(
-        &markets_path,
-        &json!({"update_timestamp":now_ms(),"groups":groups}),
-    )?;
+    write_json_atomically(&markets_path, &notarb_markets_file(json!(groups)))?;
     write_json_atomically(
         &bridge_state_path,
         &json!({
@@ -1819,45 +2036,160 @@ mod tests {
     }
 
     #[test]
-    fn pool_candidates_prefer_expanded_na_instruction_accounts() {
+    fn market_candidates_follow_na_program_offsets_not_account_array_order() {
+        // Deliberately scramble the JSON array. The bridge must use the
+        // instruction-relative position fields, not the array order or the
+        // unstable global accountIndex values.
         let event = json!({
-            "accountKeys":[
-                {"pubkey":"unrelated-pool"},
-                {"pubkey":"legacy-pool"},
-            ],
-            "notArb":{
-                "instructions":[{
-                    "index":2,
-                    "accounts":[
-                        {"position":4,"accountIndex":15,"pubkey":"na-pool-b","source":"lookup_table","writable":true},
-                        {"position":1,"accountIndex":6,"pubkey":"na-pool-a","source":"transaction","writable":true},
-                    ]
-                }]
-            }
+            "accountKeys":[{"pubkey":"legacy-a"},{"pubkey":"legacy-b"}],
+            "notArb":{"instructions":[{
+                "index":2,
+                "accounts":[
+                    {"position":49,"accountIndex":149,"pubkey":"cpmm-market","source":"lookup_table","writable":true},
+                    {"position":47,"accountIndex":147,"pubkey":POOL_LAYOUTS[2].program_id,"source":"lookup_table","writable":false},
+                    {"position":48,"accountIndex":148,"pubkey":"cpmm-event-authority","source":"lookup_table","writable":false},
+                    {"position":44,"accountIndex":144,"pubkey":"dlmm-market-c","source":"lookup_table","writable":true},
+                    {"position":43,"accountIndex":143,"pubkey":POOL_LAYOUTS[3].program_id,"source":"lookup_table","writable":false},
+                    {"position":36,"accountIndex":136,"pubkey":"orca-market","source":"lookup_table","writable":true},
+                    {"position":35,"accountIndex":135,"pubkey":POOL_LAYOUTS[4].program_id,"source":"lookup_table","writable":false},
+                    {"position":27,"accountIndex":127,"pubkey":"dlmm-market-b","source":"lookup_table","writable":true},
+                    {"position":26,"accountIndex":126,"pubkey":POOL_LAYOUTS[3].program_id,"source":"lookup_table","writable":false},
+                    {"position":18,"accountIndex":118,"pubkey":"dlmm-market-a","source":"lookup_table","writable":true},
+                    {"position":17,"accountIndex":117,"pubkey":POOL_LAYOUTS[3].program_id,"source":"lookup_table","writable":false},
+                    {"position":10,"accountIndex":110,"pubkey":"raydium-market","source":"lookup_table","writable":true},
+                    {"position":9,"accountIndex":109,"pubkey":POOL_LAYOUTS[0].program_id,"source":"lookup_table","writable":false},
+                    {"position":11,"accountIndex":111,"pubkey":"raydium-vault-not-a-market","source":"lookup_table","writable":true}
+                ]
+            }]}
         });
-        let (addresses, source) = pool_candidate_addresses(&event);
-        assert_eq!(source, "na_instruction_accounts");
+
+        let selection = market_candidates(&event);
+        assert_eq!(selection.source, "na_instruction_market_pairs");
         assert_eq!(
-            addresses,
-            vec!["na-pool-a".to_owned(), "na-pool-b".to_owned()]
+            selection
+                .candidates
+                .iter()
+                .map(|candidate| candidate.address.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "raydium-market",
+                "dlmm-market-a",
+                "dlmm-market-b",
+                "orca-market",
+                "dlmm-market-c",
+                "cpmm-market",
+            ]
         );
         assert_eq!(
-            na_instruction_references(&event, "na-pool-b"),
+            selection
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.dex_program_position,
+                        candidate.market_position,
+                        candidate.market_offset,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(9), Some(10), Some(1)),
+                (Some(17), Some(18), Some(1)),
+                (Some(26), Some(27), Some(1)),
+                (Some(35), Some(36), Some(1)),
+                (Some(43), Some(44), Some(1)),
+                (Some(47), Some(49), Some(2)),
+            ]
+        );
+        assert!(selection
+            .candidates
+            .iter()
+            .all(|candidate| candidate.address != "cpmm-event-authority"
+                && candidate.address != "raydium-vault-not-a-market"));
+        assert_eq!(
+            na_instruction_market_references(&event, "cpmm-market"),
             vec![json!({
                 "topLevelInstructionIndex":2,
-                "accountPosition":4,
-                "accountIndex":15,
+                "dexProgramId":POOL_LAYOUTS[2].program_id,
+                "dexProgramPosition":47,
+                "marketPosition":49,
+                "marketOffset":2,
+                "accountIndex":149,
                 "source":"lookup_table",
                 "writable":true,
             })]
         );
+    }
+
+    #[test]
+    fn fresh_na_vector_never_falls_back_to_legacy_accounts() {
+        let fresh_without_markets = json!({
+            "accountKeys":[{"pubkey":"legacy-pool"}],
+            "notArb":{"instructions":[{"index":2,"accounts":[]}]}
+        });
+        let selection = market_candidates(&fresh_without_markets);
+        assert_eq!(selection.source, "na_instruction_market_pairs");
+        assert!(selection.candidates.is_empty());
 
         let legacy = json!({"accountKeys":[{"pubkey":"legacy-b"},{"pubkey":"legacy-a"}]});
-        let (addresses, source) = pool_candidate_addresses(&legacy);
-        assert_eq!(source, "legacy_transaction_accounts");
+        let selection = market_candidates(&legacy);
+        assert_eq!(selection.source, "legacy_transaction_accounts");
         assert_eq!(
-            addresses,
-            vec!["legacy-a".to_owned(), "legacy-b".to_owned()]
+            selection
+                .candidates
+                .iter()
+                .map(|candidate| candidate.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["legacy-a", "legacy-b"]
+        );
+    }
+
+    #[test]
+    fn na_instruction_groups_preserve_all_verified_markets_in_route_order() {
+        let market = |address: &str, market_position: u64| Pool {
+            address: address.to_owned(),
+            program_id: "test-dex".to_owned(),
+            label: "test market".to_owned(),
+            data_len: 1,
+            target_mints: Vec::new(),
+            contains_wsol: false,
+            instruction_index: Some(2),
+            dex_program_position: Some(market_position - 1),
+            market_position: Some(market_position),
+            market_offset: Some(1),
+        };
+        let pools = vec![
+            market("market-45", 44),
+            market("market-19", 18),
+            market("market-37", 36),
+            market("market-11", 10),
+            market("market-28", 27),
+        ];
+        let groups = market_groups("na_instruction_market_pairs", &[], &pools, 2);
+        assert_eq!(
+            groups,
+            vec![vec![
+                "market-11".to_owned(),
+                "market-19".to_owned(),
+                "market-28".to_owned(),
+                "market-37".to_owned(),
+                "market-45".to_owned(),
+            ]]
+        );
+        let markets_file = notarb_markets_file(json!(groups));
+        assert!(markets_file
+            .get("update_timestamp")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert_eq!(
+            markets_file.get("groups"),
+            Some(&json!([[
+                "market-11",
+                "market-19",
+                "market-28",
+                "market-37",
+                "market-45"
+            ]]))
         );
     }
 
@@ -1872,6 +2204,10 @@ mod tests {
                 data_len: 653,
                 target_mints: vec![mint.clone()],
                 contains_wsol: false,
+                instruction_index: None,
+                dex_program_position: None,
+                market_position: None,
+                market_offset: None,
             },
             Pool {
                 address: "pump".to_owned(),
@@ -1880,6 +2216,10 @@ mod tests {
                 data_len: 301,
                 target_mints: vec![mint.clone()],
                 contains_wsol: true,
+                instruction_index: None,
+                dex_program_position: None,
+                market_position: None,
+                market_offset: None,
             },
             Pool {
                 address: "meteora".to_owned(),
@@ -1888,10 +2228,14 @@ mod tests {
                 data_len: 904,
                 target_mints: vec![mint.clone()],
                 contains_wsol: true,
+                instruction_index: None,
+                dex_program_position: None,
+                market_position: None,
+                market_offset: None,
             },
         ];
         assert_eq!(
-            market_groups(&[mint], &pools, 4),
+            market_groups("legacy_transaction_accounts", &[mint], &pools, 4),
             vec![vec!["meteora".to_owned(), "pump".to_owned()]]
         );
     }

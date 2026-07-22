@@ -26,14 +26,16 @@ const WSOL_MINT = 'So11111111111111111111111111111111111111112';
 const ADDRESS_LOOKUP_TABLE_PROGRAM = 'AddressLookupTab1e1111111111111111111111111';
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
-// A pool state is selected only when both its owner and known account size
-// agree. This excludes DEX globals, bin arrays, vaults, and program configs.
+// A market state is selected only when both its owner and known account size
+// agree. The offset is instruction-relative: it follows the DEX program in
+// NotArb's outer NA instruction. Meteora CPMM has one event-authority account
+// between its program and the concrete market-state account.
 const POOL_LAYOUTS = new Map([
-  ['675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', { label: 'Raydium AMM v4', sizes: new Set([752]) }],
-  ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', { label: 'Pump.fun AMM', sizes: new Set([301]) }],
-  ['cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG', { label: 'Meteora CPMM', sizes: new Set([1112]) }],
-  ['LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', { label: 'Meteora DLMM', sizes: new Set([904]) }],
-  ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', { label: 'Orca Whirlpool', sizes: new Set([653]) }],
+  ['675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', { label: 'Raydium AMM v4', sizes: new Set([752]), marketOffset: 1 }],
+  ['pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA', { label: 'Pump.fun AMM', sizes: new Set([301]), marketOffset: 1 }],
+  ['cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG', { label: 'Meteora CPMM', sizes: new Set([1112]), marketOffset: 2 }],
+  ['LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', { label: 'Meteora DLMM', sizes: new Set([904]), marketOffset: 1 }],
+  ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', { label: 'Orca Whirlpool', sizes: new Set([653]), marketOffset: 1 }],
 ]);
 
 const args = parseArgs(process.argv.slice(2));
@@ -251,18 +253,84 @@ async function getAccounts(addresses) {
   return result;
 }
 
-function routePools(event, accounts) {
+function hasNaInstructionVector(event) {
+  return Array.isArray(event.notArb?.instructions);
+}
+
+function naInstructionMarketCandidates(event) {
+  const candidates = [];
+  for (const instruction of event.notArb?.instructions ?? []) {
+    const accounts = Array.isArray(instruction?.accounts) ? instruction.accounts : [];
+    for (const programAccount of accounts) {
+      const layout = POOL_LAYOUTS.get(programAccount?.pubkey);
+      const dexProgramPosition = programAccount?.position;
+      if (!layout || !Number.isInteger(dexProgramPosition)) continue;
+      const marketPosition = dexProgramPosition + layout.marketOffset;
+      const market = accounts.find((account) => account?.position === marketPosition);
+      if (typeof market?.pubkey !== 'string' || market.writable !== true) continue;
+      candidates.push({
+        address: market.pubkey,
+        expectedProgramId: programAccount.pubkey,
+        instructionIndex: Number.isInteger(instruction?.index) ? instruction.index : null,
+        dexProgramPosition,
+        marketPosition,
+        marketOffset: layout.marketOffset,
+        accountIndex: Number.isInteger(market.accountIndex) ? market.accountIndex : null,
+        source: typeof market.source === 'string' ? market.source : null,
+        writable: true,
+      });
+    }
+  }
+  candidates.sort((left, right) => (left.instructionIndex ?? -1) - (right.instructionIndex ?? -1)
+    || left.marketPosition - right.marketPosition
+    || left.address.localeCompare(right.address));
+  return candidates.filter((candidate, index) => index === 0
+    || candidate.instructionIndex !== candidates[index - 1].instructionIndex
+    || candidate.marketPosition !== candidates[index - 1].marketPosition
+    || candidate.address !== candidates[index - 1].address);
+}
+
+function marketCandidates(event) {
+  if (hasNaInstructionVector(event)) {
+    return { source: 'na_instruction_market_pairs', candidates: naInstructionMarketCandidates(event) };
+  }
+  // Historical receipts did not retain the ordered NA instruction metas. Keep
+  // this fallback only for inspecting old evidence; fresh records never use it.
+  const addresses = [...new Set((event.accountKeys ?? []).map((key) => key?.pubkey)
+    .filter((address) => typeof address === 'string' && address.length > 0))].sort();
+  return {
+    source: 'legacy_transaction_accounts',
+    candidates: addresses.map((address) => ({
+      address,
+      expectedProgramId: null,
+      instructionIndex: null,
+      dexProgramPosition: null,
+      marketPosition: null,
+      marketOffset: null,
+      accountIndex: null,
+      source: null,
+      writable: false,
+    })),
+  };
+}
+
+function routePools(event, candidates, accounts) {
   const targets = candidateMints(event).map((item) => ({ ...item, bytes: base58Decode(item.mint) }));
   const wsolBytes = base58Decode(WSOL_MINT);
   const discovered = [];
-  for (const { address, account } of accounts) {
+  for (let index = 0; index < candidates.length && index < accounts.length; index += 1) {
+    const candidate = candidates[index];
+    const { address, account } = accounts[index];
+    if (candidate.expectedProgramId && account?.owner !== candidate.expectedProgramId) continue;
     const layout = POOL_LAYOUTS.get(account?.owner);
     const encoded = account?.data?.[0];
     if (!layout || !encoded) continue;
     const data = Buffer.from(encoded, 'base64');
     if (!layout.sizes.has(data.length)) continue;
     const matches = targets.filter((target) => includesBytes(data, target.bytes));
-    if (!matches.length) continue;
+    // A fresh NA instruction supplies the complete market route. Intermediate
+    // WSOL-USDC or target-USDC legs may not contain the headline target mint.
+    if (!matches.length && candidate.instructionIndex === null) continue;
     discovered.push({
       address,
       dexProgramId: account.owner,
@@ -270,12 +338,39 @@ function routePools(event, accounts) {
       dataLength: data.length,
       targetMints: matches.map((target) => target.mint),
       containsWsol: includesBytes(data, wsolBytes),
+      instructionIndex: candidate.instructionIndex,
+      dexProgramPosition: candidate.dexProgramPosition,
+      marketPosition: candidate.marketPosition,
+      marketOffset: candidate.marketOffset,
     });
   }
   return discovered;
 }
 
-function marketGroups(targets, pools) {
+function marketGroups(source, targets, pools) {
+  if (source === 'na_instruction_market_pairs') {
+    const byInstruction = new Map();
+    for (const pool of pools) {
+      if (!Number.isInteger(pool.instructionIndex)) continue;
+      const current = byInstruction.get(pool.instructionIndex) ?? [];
+      current.push(pool);
+      byInstruction.set(pool.instructionIndex, current);
+    }
+    return [...byInstruction.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, markets]) => {
+        const seen = new Set();
+        return markets
+          .sort((left, right) => left.marketPosition - right.marketPosition || left.address.localeCompare(right.address))
+          .map((market) => market.address)
+          .filter((address) => {
+            if (seen.has(address)) return false;
+            seen.add(address);
+            return true;
+          });
+      })
+      .filter((group) => group.length >= 2);
+  }
   const groups = [];
   for (const target of targets) {
     const candidates = pools.filter((pool) => pool.targetMints.includes(target.mint));
@@ -439,14 +534,37 @@ async function build() {
     return;
   }
 
-  const addresses = [...new Set(event.accountKeys.map((key) => key.pubkey))];
+  const candidateMarkets = marketCandidates(event);
+  if (candidateMarkets.source === 'na_instruction_market_pairs' && candidateMarkets.candidates.length === 0) {
+    await hold('missing_na_market_pairs', {
+      candidateDexPrograms,
+      message: 'expanded NA instruction accounts contained no writable supported DEX market-state at its required relative offset',
+    });
+    return;
+  }
+  const addresses = candidateMarkets.candidates.map((candidate) => candidate.address);
   const accounts = await getAccounts(addresses);
   const observedAlts = observedLookupTables(event);
   const altAccounts = observedAlts.length ? await getAccounts(observedAlts) : [];
   const { valid: lookupTables, rejected: rejectedLookupTables } = validateLookupTables(altAccounts);
   const targets = candidateMints(event);
-  const pools = routePools(event, accounts);
-  const groups = marketGroups(targets, pools);
+  const pools = routePools(event, candidateMarkets.candidates, accounts);
+  if (candidateMarkets.source === 'na_instruction_market_pairs'
+    && pools.length !== candidateMarkets.candidates.length) {
+    await hold('invalid_na_market_pair', {
+      candidateMarketCount: candidateMarkets.candidates.length,
+      validatedMarketCount: pools.length,
+      candidateMarkets: candidateMarkets.candidates.map((candidate) => ({
+        address: candidate.address,
+        dexProgramId: candidate.expectedProgramId,
+        dexProgramPosition: candidate.dexProgramPosition,
+        marketPosition: candidate.marketPosition,
+        marketOffset: candidate.marketOffset,
+      })),
+    });
+    return;
+  }
+  const groups = marketGroups(candidateMarkets.source, targets, pools);
   if (rejectedLookupTables.length) {
     await hold('unreadable_route_alt', { observedLookupTables: observedAlts, rejectedLookupTables });
     return;
@@ -454,6 +572,7 @@ async function build() {
   if (!groups.length) {
     await hold('insufficient_validated_pools', {
       validatedPoolCount: pools.length,
+      marketCandidateSource: candidateMarkets.source,
       candidateDexPrograms,
       observedLookupTables: observedAlts,
     });
@@ -479,6 +598,21 @@ async function build() {
   const generation = Number(bridgeState?.generation ?? 0) + 1;
   await writeTargetLookupTables(event, lookupTables, generation);
   const generatedAt = new Date().toISOString();
+  const validatedMarkets = pools.map((pool) => ({
+    ...pool,
+    naInstructionReferences: candidateMarkets.candidates
+      .filter((candidate) => candidate.address === pool.address)
+      .map((candidate) => ({
+        topLevelInstructionIndex: candidate.instructionIndex,
+        dexProgramId: candidate.expectedProgramId,
+        dexProgramPosition: candidate.dexProgramPosition,
+        marketPosition: candidate.marketPosition,
+        marketOffset: candidate.marketOffset,
+        accountIndex: candidate.accountIndex,
+        source: candidate.source,
+        writable: candidate.writable,
+      })),
+  }));
   const route = {
     schemaVersion: 1,
     generatedAt,
@@ -496,7 +630,11 @@ async function build() {
     observedLookupTables: observedAlts,
     selectedLookupTables: lookupTables,
     rejectedLookupTables,
-    validatedPoolStates: pools,
+    marketCandidateSource: candidateMarkets.source,
+    validatedMarketStates: validatedMarkets,
+    // Compatibility aliases for existing route-inspection tooling.
+    poolCandidateSource: candidateMarkets.source,
+    validatedPoolStates: validatedMarkets,
     selectedGroups: groups,
     automation: {
       mode: 'auto_follow',
