@@ -17,6 +17,9 @@ use std::{
 const WATCHED_ADDRESS: &str = "LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9";
 const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const ADDRESS_LOOKUP_TABLE_PROGRAM: &str = "AddressLookupTab1e1111111111111111111111111";
+// The bridge read RPC rejects getMultipleAccounts payloads above 50 addresses.
+// Keep this read-path ceiling separate from any send-path limits.
+const MAX_GET_MULTIPLE_ACCOUNTS_ADDRESSES: usize = 50;
 
 #[derive(Clone, Copy)]
 struct PoolLayout {
@@ -425,12 +428,41 @@ fn unsupported_dexes(event: &Value) -> Vec<Value> {
         .collect()
 }
 
+fn rpc_account_batches(addresses: &[String]) -> impl Iterator<Item = &[String]> {
+    addresses.chunks(MAX_GET_MULTIPLE_ACCOUNTS_ADDRESSES)
+}
+
+fn decode_rpc_accounts(addresses: &[String], values: &[Value]) -> Vec<Account> {
+    // zip intentionally preserves the historical handling of malformed
+    // result lengths: only positions returned by the RPC are materialized.
+    addresses
+        .iter()
+        .zip(values)
+        .map(|(address, account)| {
+            let owner = account
+                .get("owner")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let data = value_path(account, &["data"])
+                .and_then(Value::as_array)
+                .and_then(|data| data.first())
+                .and_then(Value::as_str)
+                .and_then(|encoded| BASE64.decode(encoded).ok());
+            Account {
+                address: address.clone(),
+                owner,
+                data,
+            }
+        })
+        .collect()
+}
+
 fn rpc_accounts(rpc_url: &str, addresses: &[String]) -> Result<Vec<Account>> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(20))
         .build();
-    let mut accounts = Vec::new();
-    for chunk in addresses.chunks(100) {
+    let mut accounts = Vec::with_capacity(addresses.len());
+    for chunk in rpc_account_batches(addresses) {
         let request = json!({
             "jsonrpc":"2.0",
             "id": now_ms(),
@@ -449,22 +481,9 @@ fn rpc_accounts(rpc_url: &str, addresses: &[String]) -> Result<Vec<Account>> {
         let values = value_path(&response, &["result", "value"])
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("getMultipleAccounts missing result.value"))?;
-        for (address, account) in chunk.iter().zip(values) {
-            let owner = account
-                .get("owner")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            let data = value_path(account, &["data"])
-                .and_then(Value::as_array)
-                .and_then(|data| data.first())
-                .and_then(Value::as_str)
-                .and_then(|encoded| BASE64.decode(encoded).ok());
-            accounts.push(Account {
-                address: address.clone(),
-                owner,
-                data,
-            });
-        }
+        // Chunks are requested serially and extended in request order, so the
+        // merged result remains aligned with the caller's address order.
+        accounts.extend(decode_rpc_accounts(chunk, values));
     }
     Ok(accounts)
 }
@@ -1098,6 +1117,53 @@ mod tests {
             .expect("Orca Whirlpool layout");
         assert_eq!(layout.label, "Orca Whirlpool");
         assert_eq!(layout.sizes, &[653]);
+    }
+
+    #[test]
+    fn read_rpc_batches_at_fifty_and_merges_accounts_in_input_order() {
+        let addresses = (0..101)
+            .map(|index| format!("address-{index:03}"))
+            .collect::<Vec<_>>();
+        let batches = rpc_account_batches(&addresses).collect::<Vec<_>>();
+
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            vec![50, 50, 1]
+        );
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.iter().cloned())
+                .collect::<Vec<_>>(),
+            addresses
+        );
+
+        // This mirrors rpc_accounts' serial extend without using a network:
+        // each batch yields accounts in its response order, then the bridge
+        // merges each completed batch before requesting the next one.
+        let mut merged = Vec::new();
+        for batch in rpc_account_batches(&addresses) {
+            let values = batch
+                .iter()
+                .map(|address| {
+                    json!({
+                        "owner":format!("owner-{address}"),
+                        "data":[BASE64.encode(address.as_bytes()), "base64"],
+                    })
+                })
+                .collect::<Vec<_>>();
+            merged.extend(decode_rpc_accounts(batch, &values));
+        }
+        assert_eq!(
+            merged
+                .iter()
+                .map(|account| account.address.clone())
+                .collect::<Vec<_>>(),
+            addresses
+        );
+        assert_eq!(merged[0].data.as_deref(), Some(b"address-000".as_slice()));
+        assert_eq!(merged[50].data.as_deref(), Some(b"address-050".as_slice()));
+        assert_eq!(merged[100].data.as_deref(), Some(b"address-100".as_slice()));
     }
 
     #[test]
