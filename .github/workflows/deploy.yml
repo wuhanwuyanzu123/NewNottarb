@@ -46,6 +46,7 @@ jobs:
       - name: Test Node runtime
         run: |
           set -euo pipefail
+          npm run test:last:live-config
           npm run test:last:supervisor
           npm run test:last:bridge
 

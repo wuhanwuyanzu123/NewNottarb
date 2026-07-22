@@ -2,7 +2,9 @@
 # This configuration is target-only: the LAST bridge supplies its exact markets
 # and ALTs; the global scanner stays off. The default sender is one ordinary
 # Solana JSON-RPC endpoint. Configure the reader/load RPCs below consistently
-# with the deployment's LAST_READ_RPC_URL.
+# with the deployment's LAST_READ_RPC_URL. The token-account checker is the
+# exception: it uses the same indexed Helius endpoint as the ordinary sender
+# so it can enumerate the bot wallet.
 
 [notarb]
 acknowledge_terms_of_service = true
@@ -19,9 +21,10 @@ delay_ms = 250
 rpc_url = "http://127.0.0.1:18899"
 
 [token_accounts_checker]
-# Use the configured read endpoint. A node with a full token-account index
-# gives the live bot complete owned-ATA visibility.
-rpc_url = "http://127.0.0.1:18899"
+# Keep this on an indexed Helius endpoint, not the 82.39 read RPC. The 82.39
+# node may exclude the bot wallet from token-account secondary indexes.
+# It must exactly match the [[spam_rpc]] spam1 URL below.
+rpc_url = "https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY"
 delay_seconds = 3
 
 [market_loader]
@@ -71,4 +74,6 @@ cu_limit = 369100
 min_priority_fee_lamports = 1000
 max_priority_fee_lamports = 25000
 cooldown_ms = 1000
-senders = [{ id = "spam1", max_retries = 0, require_profit = true }]
+# NotArb maps this to the [[spam_rpc]] id above. `senders` is for [[sender]]
+# profiles and leaves an ordinary spam RPC unresolved.
+spam_senders = [{ rpc = "spam1", max_retries = 0, require_profit = true }]

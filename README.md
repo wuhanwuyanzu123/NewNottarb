@@ -31,7 +31,8 @@ services without a local SSH forward:
   -> Rust pool/ALT validation and NotArb loader reads
 
 Helius ordinary JSON-RPC
-  -> the single configured live `spam1` sender
+  -> one shared indexed endpoint for `token_accounts_checker` and live `spam1`
+     `[[spam_rpc]]` sending
 ```
 
 The deployment templates create `notarb-last-pipeline.service` and
@@ -44,6 +45,14 @@ ssh root@82.23.138.51 "systemctl --no-pager status notarb-last-pipeline.service 
 
 The two local ports `127.0.0.1:18100` and `127.0.0.1:18899` are not part of
 the deployed runtime. They remain an optional local-development topology only.
+
+The live TOML is private under `/etc/notarb-last`, whereas the bridge writes
+the rotating markets and ALT files beneath the CI-managed
+`/opt/notarb-last/current` release pointer. The live systemd unit maintains
+two stable leaf symlinks in `/etc/notarb-last` before starting the supervisor.
+Keep the TOML paths relative (`last-target-markets.json` and
+`last-target-lookup-tables.txt`); do not point the private config at an
+individual release directory.
 
 ## LAST observer
 
@@ -225,7 +234,8 @@ LAST activity key may launch the next child.
 Its local runnable copy is ignored by Git. It keeps the global scanner off and
 uses only the bridge-written `last-target-markets.json` plus its exact active
 ALT file. The profile enables one executor, one ordinary Helius JSON-RPC
-sender (`[[spam_rpc]]`), an enabled SOL strategy, and `flash_loan = true`.
+sender (`[[spam_rpc]]`, referenced by `spam_senders = [{ rpc = "spam1", ... }]`),
+an enabled SOL strategy, and `flash_loan = true`.
 
 ```powershell
 Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml
@@ -241,11 +251,14 @@ Java child absent; a fresh bridge-validated route starts one
 `run-notarb-last-target-live.sh` child. The Windows `.cmd` wrapper remains for
 local development only.
 
-The ordinary-RPC sender is `spam1`; it uses the configured Helius endpoint,
-keeps `require_profit = true`, and has no Jito tip. Priority fees remain capped
-at 25,000 lamports and the cooldown is 1,000 ms. `token_accounts_checker`
-remains configured separately because the live bot needs current token-account
-visibility for its own keypair.
+For NotArb v1.1.2, the ordinary-RPC sender is `[[spam_rpc]] spam1`; do not
+substitute `[[sender]]` / `senders` for this profile.
+`[[swap.strategy]].spam_senders` maps to it with `rpc = "spam1"`, keeps
+`require_profit = true`, and has no Jito tip. `token_accounts_checker.rpc_url`
+must exactly match `[[spam_rpc]].url`, so the bot can enumerate its own token
+accounts through the same indexed Helius endpoint. Priority fees remain capped
+at 25,000 lamports and the cooldown is 1,000 ms. The blockhash, price, market,
+and ALT loaders continue to use the direct 82.39 read RPC.
 
 ## Runtime evidence
 

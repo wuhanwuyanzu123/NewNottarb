@@ -16,8 +16,8 @@
 - When the validated market generation is unchanged but a new LAST route check has different ALT indexes or writable account metas, the Rust bridge refreshes the route-evidence fingerprint before publishing the renewed active lease. This keeps the observer, route record, and supervisor coherent without creating a duplicate generation.
 - The supervisor uses local status/markets file mtimes, not WSL payload timestamps, for a 20-second markets heartbeat and activity freshness; `held` and stale route status still end the child lease immediately.
 - A lifecycle activation key combines generation and LAST signature. The supervisor never relaunches a stopped/failed child for that same key after a transient publication gap; the next fresh validated signature is required for another child.
-- `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
-- The deployment target is `root@82.23.138.51`: the two systemd unit templates, Linux runners, and direct 82.39 endpoint wiring are ready, while all server units/processes and all local Windows/WSL runtime processes are stopped.
+- `npm run test:last:live-config` verifies the live ordinary-RPC contract offline: one `[[spam_rpc]]` plus `spam_senders`, a matching indexed Helius token-account checker, and the four direct reader RPC roles. `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
+- The deployment target is `root@82.23.138.51`: GitHub Actions builds the compiled Linux bridge and deploys immutable releases with the two systemd unit templates. Local Windows/WSL runners remain development-only.
 
 ## Current topology
 
@@ -37,7 +37,8 @@
   -> 82.23.138.51 Rust validation and NotArb loaders
 
 Helius ordinary JSON-RPC
-  -> 82.23.138.51 [[spam_rpc]] spam1 sender
+  -> 82.23.138.51 shared indexed endpoint for [[spam_rpc]] spam1 sending
+     and token_accounts_checker
 ```
 
 The Linux deployment process path is:
@@ -72,8 +73,8 @@ systemd: notarb-last-live-supervisor.service
 ## Live profile inputs
 
 1. Set the ignored server `/etc/notarb-last/notarb-last-grpc-live.toml` to the bot keypair path. No wallet key is committed to this repository.
-2. Configure `[token_accounts_checker]` to an RPC that can enumerate the bot wallet's token accounts. The direct 82 `:8899` node serves market/blockhash/ALT reads but does not expose arbitrary-wallet token-account secondary indexes.
-3. The tracked ordinary-RPC profile uses one Helius `[[spam_rpc]]` sender, keeps `require_profit = true`, caps priority fee at 25,000 lamports, uses no Jito tip, and has a 1,000 ms cooldown. Adjust the ignored local copy if different runtime limits are desired.
+2. Configure `[token_accounts_checker].rpc_url` to exactly match `[[spam_rpc]].url`, using an indexed Helius endpoint that can enumerate the bot wallet's token accounts. The direct 82 `:8899` node serves market/blockhash/ALT reads but does not expose arbitrary-wallet token-account secondary indexes.
+3. The tracked NotArb v1.1.2 ordinary-RPC profile uses one Helius `[[spam_rpc]]` sender and `spam_senders = [{ rpc = "spam1", ... }]` (not `[[sender]]` / `senders`), keeps `require_profit = true`, caps priority fee at 25,000 lamports, uses no Jito tip, and has a 1,000 ms cooldown. Adjust the ignored local copy if different runtime limits are desired.
 4. Durable nonces remain optional. When used, place only nonce accounts controlled by the configured bot wallet in a `[[nonce_pool]]`.
 
 ## Safe validation command

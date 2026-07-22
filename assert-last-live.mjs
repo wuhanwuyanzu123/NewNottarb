@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Guard the local LAST live runner. It checks that the process remains
 // target-only while explicitly enabling one ordinary Helius RPC sender and
-// flash loans. Read/load RPCs must match the configured LAST_READ_RPC_URL.
+// flash loans. All ordinary reader/load RPCs must match LAST_READ_RPC_URL;
+// the token-account checker must use the same indexed Helius endpoint as the
+// ordinary spam sender.
 
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -14,6 +16,10 @@ if (!/^https?:\/\/[^\s]+$/i.test(readRpcUrl) || /REPLACE_WITH_/i.test(readRpcUrl
   fail('LAST_READ_RPC_URL must be a configured HTTP(S) read RPC endpoint.');
 }
 const expectedReadRpcValue = JSON.stringify(readRpcUrl);
+const isConfiguredHeliusMainnetRpc = (value) => (
+  /^https:\/\/mainnet\.helius-rpc\.com\/\?api-key=.+$/i.test(value)
+  && !/REPLACE_WITH_/i.test(value)
+);
 
 const text = await readFile(configPath, 'utf8');
 const sections = [];
@@ -70,9 +76,11 @@ expect(exactlyOne('transaction_executor'), 'threads', '1');
 expect(exactlyOne('wsol_unwrapper'), 'enabled', 'false');
 const tokenAccounts = exactlyOne('token_accounts_checker');
 const tokenAccountsRpc = stringValue(tokenAccounts, 'rpc_url');
-if (!tokenAccountsRpc || /^REPLACE_WITH_/i.test(tokenAccountsRpc)) fail('[token_accounts_checker] rpc_url must be configured.');
+if (!isConfiguredHeliusMainnetRpc(tokenAccountsRpc)) {
+  fail('[token_accounts_checker] rpc_url must be a configured indexed Helius mainnet endpoint.');
+}
 expect(tokenAccounts, 'delay_seconds', '3');
-for (const readRpcSection of ['blockhash_updater', 'price_updater', 'token_accounts_checker', 'market_loader', 'lookup_table_loader']) {
+for (const readRpcSection of ['blockhash_updater', 'price_updater', 'market_loader', 'lookup_table_loader']) {
   expect(exactlyOne(readRpcSection), 'rpc_url', expectedReadRpcValue);
 }
 exactlyOneEnabledPath('markets_file', 'last-target-markets.json');
@@ -83,9 +91,11 @@ const spamRpc = exactlyOne('spam_rpc');
 expect(spamRpc, 'enabled', 'true');
 expect(spamRpc, 'id', '"spam1"');
 const sendingRpcUrl = stringValue(spamRpc, 'url');
-if (!/^https:\/\/mainnet\.helius-rpc\.com\/\?api-key=.+$/i.test(sendingRpcUrl)
-  || /REPLACE_WITH_/i.test(sendingRpcUrl)) {
+if (!isConfiguredHeliusMainnetRpc(sendingRpcUrl)) {
   fail('[[spam_rpc]] url must be a configured Helius mainnet RPC endpoint.');
+}
+if (tokenAccountsRpc !== sendingRpcUrl) {
+  fail('[token_accounts_checker] rpc_url must exactly match the [[spam_rpc]] spam1 url.');
 }
 
 const swap = exactlyOne('swap');
@@ -94,12 +104,17 @@ const defaults = exactlyOne('swap.strategy_defaults');
 expect(defaults, 'flash_loan', 'true');
 const strategy = exactlyOne('swap.strategy');
 expect(strategy, 'enabled', 'true');
-const strategySenders = strategy.values.get('senders') ?? '';
-if (!/id\s*=\s*"spam1"/.test(strategySenders)
-  || !/max_retries\s*=\s*0/.test(strategySenders)
-  || !/require_profit\s*=\s*true/.test(strategySenders)
-  || /jito|\bmin_tip\b|\bmax_tip\b/i.test(strategySenders)) {
-  fail('[[swap.strategy]] senders must use only spam1 with max_retries=0 and require_profit=true.');
+if (strategy.values.has('senders')) {
+  fail('[[swap.strategy]] must use spam_senders, not senders.');
+}
+const strategySpamSenders = strategy.values.get('spam_senders') ?? '';
+const spamSenderRpcCount = (strategySpamSenders.match(/\brpc\s*=/g) ?? []).length;
+if (!/rpc\s*=\s*"spam1"/.test(strategySpamSenders)
+  || spamSenderRpcCount !== 1
+  || !/max_retries\s*=\s*0/.test(strategySpamSenders)
+  || !/require_profit\s*=\s*true/.test(strategySpamSenders)
+  || /jito|\bmin_tip\b|\bmax_tip\b/i.test(strategySpamSenders)) {
+  fail('[[swap.strategy]] spam_senders must use only rpc=spam1 with max_retries=0 and require_profit=true.');
 }
 expect(strategy, 'cu_limit', '369100');
 expect(strategy, 'min_priority_fee_lamports', '1000');

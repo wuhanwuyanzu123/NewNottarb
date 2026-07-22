@@ -36,9 +36,12 @@ absent. The current server paths are:
 ```
 
 When deployed, the server connects directly to `82.39.215.201:10000` (gRPC) and
-`82.39.215.201:8899` (read RPC). `[[spam_rpc]] spam1` is the single ordinary
-Helius sending endpoint. There are no Windows/WSL observer processes or local
-SSH tunnels in this deployment.
+`82.39.215.201:8899` (read RPC). The blockhash, price, market, and ALT loaders
+stay on that read RPC; `[token_accounts_checker].rpc_url` exactly matches the
+indexed Helius `[[spam_rpc]] spam1` URL. For NotArb v1.1.2, `spam1` is selected
+through `spam_senders = [{ rpc = "spam1", ... }]`; it is the single ordinary
+Helius sending endpoint, not a `[[sender]]` / `senders` profile. There are no
+Windows/WSL observer processes or local SSH tunnels in this deployment.
 
 ## CI/CD deployment to 82.23
 
@@ -49,8 +52,12 @@ SSH tunnels in this deployment.
    `/etc/notarb-last/keypair.json` and
    `/etc/notarb-last/notarb-last-grpc-live.toml` as `root:root`, mode `0600`.
    Start the live TOML from the tracked example, set the bot keypair and
-   Helius API key, and change every loader read RPC plus `grpc_url` to the
-   direct 82.39 endpoints. Do not commit this file or the keypair.
+   Helius API key, set `blockhash_updater`, `price_updater`, `market_loader`,
+   `lookup_table_loader`, and `grpc_url` to the direct 82.39 endpoints, then
+   set `[token_accounts_checker].rpc_url` and `[[spam_rpc]].url` to the exact
+   same indexed Helius endpoint. Keep the markets and ALT paths relative; the
+   live service maintains their stable `/etc/notarb-last` links. Do not commit
+   this file or the keypair.
 3. For the first deployment only, place the matching NotArb JAR at
    `/opt/notarb-last/.notarb-1.1.2.jar`. The workflow verifies it and installs
    the private runtime copy under `/var/lib/notarb-last/`.
@@ -275,7 +282,9 @@ npm run supervise:last:live
 ```
 
 The profile has `transaction_executor.threads = 1`, one ordinary Helius
-`[[spam_rpc]]` sender, an enabled SOL strategy, and
+`[[spam_rpc]]` sender selected with `spam_senders = [{ rpc = "spam1", ... }]`
+(the NotArb v1.1.2 ordinary-RPC pair, rather than `[[sender]]` / `senders`), an
+enabled SOL strategy, and
 `[swap.strategy_defaults] flash_loan = true`.
 It keeps `[notarb_markets] enabled = false`, loading only the current
 `last-target-markets.json` and `last-target-lookup-tables.txt` written by the
@@ -289,10 +298,10 @@ when the lease becomes quiet, held, stale, or incoherent. Its logs are
 `last-notarb-live-supervisor.stdout.log` and
 `last-notarb-live-supervisor.stderr.log`.
 
-`[token_accounts_checker]` needs an RPC that can enumerate the bot wallet's
-token accounts. The 82 read-RPC tunnel remains appropriate for the bridge and
-standard loader reads; use a local forward to an indexed endpoint if the
-configured checker needs full token-account visibility.
+`[token_accounts_checker]` must use the exact `[[spam_rpc]] spam1` indexed
+Helius URL, so it can enumerate the bot wallet's token accounts. The 82 read
+RPC remains appropriate for the bridge and the blockhash, price, market, and
+ALT loaders; do not send the token-account checker to that unindexed endpoint.
 
 No private material should ever be committed. `.gitignore` excludes the local
 run config, wallet JSON files, event data, logs, and dependencies.
