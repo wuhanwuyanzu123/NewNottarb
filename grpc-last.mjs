@@ -204,6 +204,38 @@ function instructionProgramId(instruction, keys) {
   return keys[instruction?.programIdIndex]?.pubkey ?? null;
 }
 
+// The account order inside a compiled NA instruction is relative to that
+// instruction.  Preserve both the relative position and the resolved global
+// message-account index so the route bridge can use exactly the accounts NA
+// received, including accounts loaded through an ALT.  A global account-key
+// offset is not stable when a route, DEX mix, or ALT selection changes.
+function extractTopLevelNotArbInstructions(message, keys) {
+  const result = [];
+  for (const [index, instruction] of (message?.instructions ?? []).entries()) {
+    const programId = instructionProgramId(instruction, keys);
+    if (programId !== NOTARB_PROGRAM) continue;
+    const accounts = Array.from(instruction?.accounts ?? []).map((rawIndex, position) => {
+      const accountIndex = Number(rawIndex);
+      const key = Number.isInteger(accountIndex) ? keys[accountIndex] : null;
+      return {
+        position,
+        accountIndex: Number.isInteger(accountIndex) ? accountIndex : null,
+        pubkey: key?.pubkey ?? null,
+        source: key?.source ?? null,
+        writable: Boolean(key?.writable),
+        signer: Boolean(key?.signer),
+      };
+    });
+    result.push({
+      index,
+      programId,
+      programIdIndex: Number(instruction?.programIdIndex ?? -1),
+      accounts,
+    });
+  }
+  return result;
+}
+
 function allInvokedDexes(message, meta, keys) {
   const invoked = new Set();
   for (const instruction of message?.instructions ?? []) {
@@ -348,10 +380,8 @@ function summarizeUpdate(update) {
   const keys = expandedAccountKeys(message, meta);
   const rows = tokenBalanceRows(meta);
   const deltas = walletTokenDeltas(rows);
-  const topLevelNotArbIndexes = (message.instructions ?? [])
-    .map((instruction, index) => ({ index, programId: instructionProgramId(instruction, keys) }))
-    .filter((item) => item.programId === NOTARB_PROGRAM)
-    .map((item) => item.index);
+  const topLevelNotArbInstructions = extractTopLevelNotArbInstructions(message, keys);
+  const topLevelNotArbIndexes = topLevelNotArbInstructions.map((item) => item.index);
   const noProfitLogs = (meta.logMessages ?? []).filter((line) => /No arbitrage profit found!/i.test(line));
   const invokedPrograms = allInvokedDexes(message, meta, keys);
   const intendedMints = candidateMints(rows);
@@ -394,6 +424,7 @@ function summarizeUpdate(update) {
       matched: topLevelNotArbIndexes.length > 0,
       programId: topLevelNotArbIndexes.length > 0 ? NOTARB_PROGRAM : null,
       topLevelInstructionIndexes: topLevelNotArbIndexes,
+      instructions: topLevelNotArbInstructions,
       outcome: noProfitLogs.length > 0 ? 'no_arbitrage_profit' : executionKind,
       matchedLogs: noProfitLogs,
     },

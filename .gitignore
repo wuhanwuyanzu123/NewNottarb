@@ -28,3 +28,9 @@ notarb-last-grpc-dryrun.toml
 notarb-last-grpc-live.toml
 notarb-circular-last-observe.toml
 circular-last-observe.toml
+
+# Downloaded documentation snapshots and one-off local RPC probes.
+# README.md and HANDOFF.md contain the maintained, clone-ready documentation.
+.notarb-*.html
+.official-notarb-*
+.tmp-market-probe*

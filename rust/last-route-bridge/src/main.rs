@@ -683,6 +683,84 @@ fn rpc_accounts(rpc_url: &str, addresses: &[String]) -> Result<Vec<Account>> {
     Ok(accounts)
 }
 
+// A pool used by an NA route must be passed to the outer NA instruction for
+// its downstream CPI.  Prefer that instruction's expanded account metas over
+// the complete transaction account list: a transaction can carry unrelated
+// accounts or even another route.  Older persisted receipts did not retain
+// these metas, so retain the account-key fallback only for backwards
+// compatibility until the next live gRPC receipt arrives.
+fn na_instruction_account_addresses(event: &Value) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    for instruction in event
+        .get("notArb")
+        .and_then(|value| value.get("instructions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for account in instruction
+            .get("accounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(address) = account.get("pubkey").and_then(Value::as_str) {
+                values.insert(address.to_owned());
+            }
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn pool_candidate_addresses(event: &Value) -> (Vec<String>, &'static str) {
+    let instruction_accounts = na_instruction_account_addresses(event);
+    if !instruction_accounts.is_empty() {
+        return (instruction_accounts, "na_instruction_accounts");
+    }
+    let mut values = BTreeSet::new();
+    for key in event
+        .get("accountKeys")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(address) = key.get("pubkey").and_then(Value::as_str) {
+            values.insert(address.to_owned());
+        }
+    }
+    (values.into_iter().collect(), "legacy_transaction_accounts")
+}
+
+fn na_instruction_references(event: &Value, address: &str) -> Vec<Value> {
+    let mut references = Vec::new();
+    for instruction in event
+        .get("notArb")
+        .and_then(|value| value.get("instructions"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for account in instruction
+            .get("accounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if account.get("pubkey").and_then(Value::as_str) != Some(address) {
+                continue;
+            }
+            references.push(json!({
+                "topLevelInstructionIndex":instruction.get("index").cloned().unwrap_or(Value::Null),
+                "accountPosition":account.get("position").cloned().unwrap_or(Value::Null),
+                "accountIndex":account.get("accountIndex").cloned().unwrap_or(Value::Null),
+                "source":account.get("source").cloned().unwrap_or(Value::Null),
+                "writable":account.get("writable").cloned().unwrap_or(Value::Null),
+            }));
+        }
+    }
+    references
+}
+
 fn route_pools(event: &Value, accounts: &[Account]) -> Result<Vec<Pool>> {
     let targets = candidate_mints(event)
         .into_iter()
@@ -1413,18 +1491,7 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             json!({"unsupportedCandidateDexPrograms":unsupported}),
         );
     }
-    let mut unique = BTreeSet::new();
-    for key in event
-        .get("accountKeys")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some(address) = key.get("pubkey").and_then(Value::as_str) {
-            unique.insert(address.to_owned());
-        }
-    }
-    let addresses = unique.into_iter().collect::<Vec<_>>();
+    let (addresses, pool_candidate_source) = pool_candidate_addresses(&event);
     let accounts = rpc_accounts(&options.rpc_url, &addresses)?;
     let observed_alts = observed_alts(&event);
     let alt_accounts = if observed_alts.is_empty() {
@@ -1546,6 +1613,7 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
         "observedLookupTables":observed_alts,
         "selectedLookupTables":lookup_tables,
         "rejectedLookupTables":rejected_lookup_tables,
+        "poolCandidateSource":pool_candidate_source,
         "validatedPoolStates":pools.iter().map(|pool| json!({
             "address":pool.address,
             "dexProgramId":pool.program_id,
@@ -1553,6 +1621,7 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             "dataLength":pool.data_len,
             "targetMints":pool.target_mints,
             "containsWsol":pool.contains_wsol,
+            "naInstructionReferences":na_instruction_references(&event, &pool.address),
         })).collect::<Vec<_>>(),
         "selectedGroups":groups,
         "automation":{
@@ -1747,6 +1816,49 @@ mod tests {
         assert_eq!(merged[0].data.as_deref(), Some(b"address-000".as_slice()));
         assert_eq!(merged[50].data.as_deref(), Some(b"address-050".as_slice()));
         assert_eq!(merged[100].data.as_deref(), Some(b"address-100".as_slice()));
+    }
+
+    #[test]
+    fn pool_candidates_prefer_expanded_na_instruction_accounts() {
+        let event = json!({
+            "accountKeys":[
+                {"pubkey":"unrelated-pool"},
+                {"pubkey":"legacy-pool"},
+            ],
+            "notArb":{
+                "instructions":[{
+                    "index":2,
+                    "accounts":[
+                        {"position":4,"accountIndex":15,"pubkey":"na-pool-b","source":"lookup_table","writable":true},
+                        {"position":1,"accountIndex":6,"pubkey":"na-pool-a","source":"transaction","writable":true},
+                    ]
+                }]
+            }
+        });
+        let (addresses, source) = pool_candidate_addresses(&event);
+        assert_eq!(source, "na_instruction_accounts");
+        assert_eq!(
+            addresses,
+            vec!["na-pool-a".to_owned(), "na-pool-b".to_owned()]
+        );
+        assert_eq!(
+            na_instruction_references(&event, "na-pool-b"),
+            vec![json!({
+                "topLevelInstructionIndex":2,
+                "accountPosition":4,
+                "accountIndex":15,
+                "source":"lookup_table",
+                "writable":true,
+            })]
+        );
+
+        let legacy = json!({"accountKeys":[{"pubkey":"legacy-b"},{"pubkey":"legacy-a"}]});
+        let (addresses, source) = pool_candidate_addresses(&legacy);
+        assert_eq!(source, "legacy_transaction_accounts");
+        assert_eq!(
+            addresses,
+            vec!["legacy-a".to_owned(), "legacy-b".to_owned()]
+        );
     }
 
     #[test]
