@@ -1935,7 +1935,11 @@ mod tests {
         let directory = fixture_directory("generic-retained-lease");
         fs::create_dir_all(&directory).expect("create fixture directory");
         let events = directory.join("last-grpc-events.jsonl");
-        let options = offline_options(directory.clone(), events.clone());
+        // This fixture performs several atomic writes before it exercises the
+        // retained-lease path.  Keep its clock-based lease comfortably wider
+        // than a slow debug test run; the production default remains 30 s.
+        let mut options = offline_options(directory.clone(), events.clone());
+        options.max_observer_staleness = Duration::from_secs(300);
         let route_one_observed = (Utc::now() - chrono::Duration::seconds(2))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let route_two_observed = (Utc::now() - chrono::Duration::seconds(1))
