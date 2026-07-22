@@ -30,7 +30,11 @@ const ASSERT_PATH = resolve(ROOT, args.get('assert') ?? 'assert-last-dryrun.mjs'
 const RUNNER_PATH = resolve(ROOT, args.get('runner') ?? 'run-notarb-last-target-dryrun.cmd');
 const STATE_PATH = resolve(ROOT, args.get('state') ?? '.last-notarb-supervisor-state.json');
 const POLL_MS = boundedNumber(args.get('poll-ms'), 1_000, 250, 30_000);
-const IDLE_MS = boundedNumber(args.get('idle-seconds'), 30, 5, 600) * 1_000;
+// Keep the child alive long enough to complete its NotArb bootstrap and quote
+// the just-validated route. The Rust bridge publishes `held` at the matching
+// 120-second quiet threshold, which still stops the child as soon as the
+// LAST activity lease actually expires.
+const IDLE_MS = boundedNumber(args.get('idle-seconds'), 120, 5, 600) * 1_000;
 // The bridge writes the heartbeat from WSL while this supervisor runs on
 // Windows. Leave room for the normal five-second bridge interval and a small
 // cross-runtime clock offset; a held/stale route still stops the child

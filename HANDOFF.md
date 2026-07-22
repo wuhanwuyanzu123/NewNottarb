@@ -241,7 +241,7 @@ route. It requires all of the following local evidence to agree: fresh
 `.last-grpc-state.json.lastRoute*`, `last-target-status.json` set to `active`
 for that same activity signature, a matching route generation, and fresh
 `last-target-markets.json` groups identical to the validated route. It stops
-its own child after 30 seconds of quiet activity, immediately when the bridge
+its own child after 120 seconds of quiet activity, immediately when the bridge
 reports `held` or markets go stale. It permits at most seven seconds for a
 route/market publication generation to become coherent before stopping. The
 observer and bridge remain running during those quiet periods.

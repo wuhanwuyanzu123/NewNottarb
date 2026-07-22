@@ -50,6 +50,13 @@ jobs:
           npm run test:last:supervisor
           npm run test:last:bridge
 
+      - name: Validate Linux launch scripts
+        run: |
+          set -euo pipefail
+          bash -n ./run-last-rust-pipeline.sh
+          bash -n ./run-last-notarb-live-supervisor.sh
+          bash -n ./run-notarb-last-target-live.sh
+
       - name: Set up stable Rust
         uses: dtolnay/rust-toolchain@stable
 

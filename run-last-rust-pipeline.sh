@@ -8,6 +8,10 @@ set -euo pipefail
 
 ROOT="${LAST_ROUTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 READ_RPC_URL="${LAST_READ_RPC_URL:-http://127.0.0.1:18899}"
+# NotArb needs time to load the user, prices, markets, and ALT set before it
+# can quote. Retain a validated LAST route for two minutes after the final
+# qualifying event, then publish `held` and let the supervisor stop its child.
+OBSERVER_STALENESS_SECONDS="${LAST_OBSERVER_STALENESS_SECONDS:-120}"
 NODE_BIN="${NODE_BIN:-}"
 if [[ -z "$NODE_BIN" ]]; then
   NODE_BIN="$(command -v node 2>/dev/null || true)"
@@ -33,7 +37,7 @@ trap cleanup EXIT INT TERM
 
 "$NODE_BIN" "$ROOT/grpc-last.mjs" --root="$ROOT" --no-state >>"$OBSERVER_LOG" 2>>"$OBSERVER_ERR" &
 OBSERVER_PID=$!
-bash "$ROOT/rust/last-route-bridge/run-wsl.sh" --interval=5000 --max-observer-staleness-seconds=30 --rpc="$READ_RPC_URL" >>"$BRIDGE_LOG" 2>>"$BRIDGE_ERR" &
+bash "$ROOT/rust/last-route-bridge/run-wsl.sh" --interval=5000 --max-observer-staleness-seconds="$OBSERVER_STALENESS_SECONDS" --rpc="$READ_RPC_URL" >>"$BRIDGE_LOG" 2>>"$BRIDGE_ERR" &
 BRIDGE_PID=$!
 
 wait -n "$OBSERVER_PID" "$BRIDGE_PID"

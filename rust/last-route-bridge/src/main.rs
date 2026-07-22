@@ -155,7 +155,7 @@ fn parse_options() -> Result<Options> {
         values
             .get("max-observer-staleness-seconds")
             .and_then(Value::as_str),
-        30,
+        120,
         30,
         3_600,
     );

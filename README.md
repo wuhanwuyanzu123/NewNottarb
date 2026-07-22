@@ -161,7 +161,7 @@ The normal lifecycle is:
    matching activity signature, exact pool group, and route-specific ALT set.
 3. The supervisor starts one target-only dry-run child. It keeps that child
    running while LAST activity remains fresh.
-4. After 30 seconds without a new qualifying LAST route check, or immediately
+4. After 120 seconds without a new qualifying LAST route check, or immediately
    on `held` or stale markets, the supervisor stops only the child tree it
    created. A route/market publication mismatch gets at most a seven-second
    coherence grace while the bridge atomically finishes the next generation.
