@@ -12,6 +12,7 @@ Environment=NODE_BIN=/usr/bin/node
 Environment=YELLOWSTONE_GRPC_ENDPOINT=http://82.39.215.201:10000
 Environment=LAST_READ_RPC_URL=http://82.39.215.201:8899
 Environment=LAST_OBSERVER_STALENESS_SECONDS=120
+Environment=LAST_ROUTE_BRIDGE_INTERVAL_MS=250
 Environment=LAST_ROUTE_BRIDGE_BIN=/opt/notarb-last/current/bin/last-route-bridge
 ExecStart=/usr/bin/bash /opt/notarb-last/current/run-last-rust-pipeline.sh
 Restart=always

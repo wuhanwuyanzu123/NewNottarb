@@ -58,6 +58,10 @@ const EVENTS_PATH = resolve(ROOT, 'last-grpc-events.jsonl');
 // LAST itself is still sending transactions; it never derives a mint, DEX,
 // pool, or ALT from this file.
 const ACTIVITY_PATH = resolve(ROOT, 'last-grpc-activity.json');
+// A qualified LAST route is also published as one small atomic latest-value
+// receipt.  The Rust bridge reads this before the historical JSONL so a new
+// route does not wait behind a growing append-only evidence file.
+const ROUTE_RECEIPT_PATH = resolve(ROOT, 'last-grpc-route.json');
 const ALT_USES_PATH = resolve(ROOT, 'last-grpc-alt-uses.jsonl');
 const SUMMARIES_PATH = resolve(ROOT, 'last-grpc-summaries.jsonl');
 const ERRORS_PATH = resolve(ROOT, 'last-grpc-errors.jsonl');
@@ -548,6 +552,20 @@ function isLastSignerActivity(event) {
   );
 }
 
+async function publishRouteReceipt(event) {
+  if (!isStartableRouteEvidence(event)) return false;
+  await writeJsonAtomically(ROUTE_RECEIPT_PATH, {
+    ...event,
+    routeReceipt: {
+      schemaVersion: 1,
+      kind: 'last_route_evidence',
+      watchedAddress: WATCHED_ADDRESS,
+      writtenAt: new Date().toISOString(),
+    },
+  });
+  return true;
+}
+
 async function publishLastSignerActivity(event) {
   if (!isLastSignerActivity(event)) return false;
   await writeJsonAtomically(ACTIVITY_PATH, {
@@ -600,6 +618,11 @@ async function maybeEmitSummary(event) {
 }
 
 async function persistEvent(event) {
+  // Publish the complete route first. The bridge can then validate its
+  // pools/ALTs before the companion signer-activity receipt renews a lease.
+  // This is intentionally done for every qualified event, including an
+  // unchanged fingerprint: the new signature/observedAt is the live signal.
+  const routeReceiptPublished = await publishRouteReceipt(event);
   // Keep a compact liveness receipt for every confirmed transaction actually
   // sent by LAST. `last-grpc-events.jsonl` intentionally de-duplicates quiet
   // no-fill route snapshots, so it is not a reliable heartbeat for repetitive
@@ -642,7 +665,7 @@ async function persistEvent(event) {
   recordWindow(event);
   const summaryEmitted = await maybeEmitSummary(event);
   await maybeSaveState(notable || summaryEmitted);
-  return { notable, summaryEmitted, activityPublished };
+  return { notable, summaryEmitted, activityPublished, routeReceiptPublished };
 }
 
 function compactEvent(event) {

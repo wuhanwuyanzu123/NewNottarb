@@ -2,8 +2,7 @@
 // Guard the local LAST live runner. It checks that the process remains
 // target-only while explicitly enabling one ordinary Helius RPC sender and
 // flash loans. All ordinary reader/load RPCs must match LAST_READ_RPC_URL;
-// the token-account checker must use the same indexed Helius endpoint as the
-// ordinary spam sender.
+// per the v1.1.2 official example that includes the token-account checker.
 
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -77,10 +76,7 @@ try {
 expect(exactlyOne('transaction_executor'), 'threads', '0');
 expect(exactlyOne('wsol_unwrapper'), 'enabled', 'false');
 const tokenAccounts = exactlyOne('token_accounts_checker');
-const tokenAccountsRpc = stringValue(tokenAccounts, 'rpc_url');
-if (!isConfiguredHeliusMainnetRpc(tokenAccountsRpc)) {
-  fail('[token_accounts_checker] rpc_url must be a configured indexed Helius mainnet endpoint.');
-}
+expect(tokenAccounts, 'rpc_url', expectedReadRpcValue);
 expect(tokenAccounts, 'delay_seconds', '3');
 for (const readRpcSection of ['blockhash_updater', 'price_updater', 'market_loader', 'lookup_table_loader']) {
   expect(exactlyOne(readRpcSection), 'rpc_url', expectedReadRpcValue);
@@ -96,10 +92,6 @@ const sendingRpcUrl = stringValue(spamRpc, 'url');
 if (!isConfiguredHeliusMainnetRpc(sendingRpcUrl)) {
   fail('[[spam_rpc]] url must be a configured Helius mainnet RPC endpoint.');
 }
-if (tokenAccountsRpc !== sendingRpcUrl) {
-  fail('[token_accounts_checker] rpc_url must exactly match the [[spam_rpc]] spam1 url.');
-}
-
 const swap = exactlyOne('swap');
 expect(swap, 'enabled', 'true');
 const defaults = exactlyOne('swap.strategy_defaults');

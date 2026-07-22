@@ -83,7 +83,7 @@ async function writeMarketsHeartbeat(payloadAgeMs = bridgeClockSkewMs) {
 }
 
 async function expireStatusLease() {
-  const expired = new Date(Date.now() - 61_000);
+  const expired = new Date(Date.now() - 121_000);
   await utimes(join(directory, 'last-target-status.json'), expired, expired);
 }
 
@@ -229,7 +229,7 @@ exit "$STATUS"
     // A long synthetic lease makes the test independent of slow CI filesystem
     // scheduling. The quiet-stop assertion below expires its status mtime
     // explicitly, exercising the same supervisor gate without a minute wait.
-    '--idle-seconds=60',
+    '--idle-seconds=120',
   ], { cwd: directory, windowsHide: true, stdio: 'pipe' });
   supervisor.stdout.on('data', (chunk) => { supervisorStdout += chunk; });
   supervisor.stderr.on('data', (chunk) => { supervisorStderr += chunk; });

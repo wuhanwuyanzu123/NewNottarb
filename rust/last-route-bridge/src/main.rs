@@ -61,6 +61,7 @@ const POOL_LAYOUTS: &[PoolLayout] = &[
 struct Options {
     root: PathBuf,
     events: PathBuf,
+    route_receipt: PathBuf,
     activity: PathBuf,
     rpc_url: String,
     interval: Duration,
@@ -100,9 +101,36 @@ struct RetainedLease {
 // usable LAST route.  Keep those cases distinct from malformed completed
 // JSONL and read/RPC failures: only the latter should be surfaced as bridge
 // errors.
+#[derive(Clone)]
 enum LatestEvent {
     Route(Value),
     NoRouteEvidence { events_file_present: bool },
+}
+
+// The observer atomically replaces small JSON receipts.  Comparing only
+// metadata keeps the 250 ms bridge loop from re-reading its historical JSONL
+// (which can grow to hundreds of MB) when no new route arrived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FileStamp {
+    Missing,
+    Present {
+        len: u64,
+        modified: Option<SystemTime>,
+    },
+}
+
+#[derive(Default)]
+struct BridgeCache {
+    route_receipt_loaded: bool,
+    route_receipt_stamp: Option<FileStamp>,
+    events_loaded: bool,
+    events_stamp: Option<FileStamp>,
+    latest_event: Option<LatestEvent>,
+    activity_loaded: bool,
+    activity_stamp: Option<FileStamp>,
+    activity: Option<Value>,
+    last_input_key: Option<String>,
+    last_input_stale: Option<bool>,
 }
 
 fn main() {
@@ -117,8 +145,9 @@ fn main() {
 
 fn run() -> Result<()> {
     let options = parse_options()?;
+    let mut cache = BridgeCache::default();
     loop {
-        if let Err(error) = build(&options) {
+        if let Err(error) = build_with_cache(&options, &mut cache) {
             eprintln!(
                 "{}",
                 json!({"status":"target_markets_error","error":format!("{error:#}")})
@@ -150,6 +179,11 @@ fn parse_options() -> Result<Options> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("last-grpc-events.jsonl"));
+    let route_receipt = values
+        .get("route-receipt")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("last-grpc-route.json"));
     let activity = values
         .get("activity")
         .and_then(Value::as_str)
@@ -163,7 +197,7 @@ fn parse_options() -> Result<Options> {
     let interval_ms = bounded_u64(
         values.get("interval").and_then(Value::as_str),
         5_000,
-        5_000,
+        250,
         300_000,
     );
     let staleness_seconds = bounded_u64(
@@ -179,6 +213,7 @@ fn parse_options() -> Result<Options> {
     Ok(Options {
         root,
         events,
+        route_receipt,
         activity,
         rpc_url,
         interval: Duration::from_millis(interval_ms),
@@ -259,7 +294,18 @@ fn is_route_evidence(event: &Value) -> bool {
         && !candidate_dexes(event).is_empty()
 }
 
-fn load_latest_event(path: &Path) -> Result<LatestEvent> {
+fn file_stamp(path: &Path) -> Result<FileStamp> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(FileStamp::Present {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileStamp::Missing),
+        Err(error) => Err(error).with_context(|| format!("stat input: {}", path.display())),
+    }
+}
+
+fn load_latest_event_from_jsonl(path: &Path) -> Result<LatestEvent> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -289,6 +335,73 @@ fn load_latest_event(path: &Path) -> Result<LatestEvent> {
     })
 }
 
+fn load_latest_event_cached(options: &Options, cache: &mut BridgeCache) -> Result<LatestEvent> {
+    let route_receipt_stamp = file_stamp(&options.route_receipt)?;
+    if route_receipt_stamp != FileStamp::Missing
+        && cache.route_receipt_loaded
+        && cache.route_receipt_stamp.as_ref() == Some(&route_receipt_stamp)
+        && cache.latest_event.is_some()
+    {
+        return Ok(cache
+            .latest_event
+            .clone()
+            .expect("latest event exists after cache check"));
+    }
+    cache.route_receipt_loaded = true;
+    cache.route_receipt_stamp = Some(route_receipt_stamp.clone());
+
+    if route_receipt_stamp != FileStamp::Missing {
+        // A present receipt is authoritative. Never silently fall back to an
+        // old JSONL row when a newly written receipt is malformed or lacks
+        // route evidence; holding is safer than reviving historical pools.
+        let latest = match fs::read_to_string(&options.route_receipt) {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(event) if is_route_evidence(&event) => LatestEvent::Route(event),
+                // The receipt producer uses atomic replace, so this normally
+                // means a bad/manual file rather than an in-flight write. Do
+                // not revive historical pools from JSONL in either case.
+                Ok(_) | Err(_) => LatestEvent::NoRouteEvidence {
+                    events_file_present: true,
+                },
+            },
+            // An atomic replacement can race a stat on unusual filesystems.
+            // Treat that single tick as held; the next receipt is authoritative.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                LatestEvent::NoRouteEvidence {
+                    events_file_present: true,
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read route receipt: {}", options.route_receipt.display())
+                })
+            }
+        };
+        cache.latest_event = Some(latest.clone());
+        return Ok(latest);
+    }
+
+    // Backward-compatible one-time fallback for an existing runtime that has
+    // JSONL evidence but has not yet received a compact route receipt. Once
+    // its metadata is unchanged, reuse the result instead of scanning it on
+    // every short bridge tick.
+    let events_stamp = file_stamp(&options.events)?;
+    if cache.events_loaded
+        && cache.events_stamp.as_ref() == Some(&events_stamp)
+        && cache.latest_event.is_some()
+    {
+        return Ok(cache
+            .latest_event
+            .clone()
+            .expect("latest event exists after cache check"));
+    }
+    let latest = load_latest_event_from_jsonl(&options.events)?;
+    cache.events_loaded = true;
+    cache.events_stamp = Some(events_stamp);
+    cache.latest_event = Some(latest.clone());
+    Ok(latest)
+}
+
 // The observer writes this lightweight receipt for each confirmed transaction
 // sent by LAST itself.  It is deliberately not route evidence: route evidence
 // still requires a matched NotArb instruction plus an explicit mint and DEX.
@@ -308,6 +421,21 @@ fn is_last_signer_activity(activity: &Value) -> bool {
 
 fn load_last_signer_activity(path: &Path) -> Result<Option<Value>> {
     Ok(read_json_if_present(path)?.filter(is_last_signer_activity))
+}
+
+fn load_last_signer_activity_cached(
+    options: &Options,
+    cache: &mut BridgeCache,
+) -> Result<Option<Value>> {
+    let activity_stamp = file_stamp(&options.activity)?;
+    if cache.activity_loaded && cache.activity_stamp.as_ref() == Some(&activity_stamp) {
+        return Ok(cache.activity.clone());
+    }
+    let activity = load_last_signer_activity(&options.activity)?;
+    cache.activity_loaded = true;
+    cache.activity_stamp = Some(activity_stamp);
+    cache.activity = activity.clone();
+    Ok(activity)
 }
 
 fn observed_at(value: &Value) -> Option<chrono::DateTime<Utc>> {
@@ -1048,6 +1176,59 @@ fn retained_lease(
 }
 
 fn build(options: &Options) -> Result<()> {
+    let mut cache = BridgeCache::default();
+    build_with_cache(options, &mut cache)
+}
+
+fn build_with_cache(options: &Options, cache: &mut BridgeCache) -> Result<()> {
+    let latest = load_latest_event_cached(options, cache)?;
+    match latest {
+        LatestEvent::NoRouteEvidence {
+            events_file_present,
+        } => {
+            let input_key = format!("no_route_evidence:{events_file_present}");
+            if cache.last_input_key.as_deref() == Some(input_key.as_str())
+                && cache.last_input_stale.is_none()
+            {
+                return Ok(());
+            }
+            let (_, _, _, status_path, _, _) = status_paths(&options.root);
+            let result =
+                publish_no_route_evidence_status(options, &status_path, events_file_present);
+            if result.is_ok() {
+                cache.last_input_key = Some(input_key);
+                cache.last_input_stale = None;
+            }
+            result
+        }
+        LatestEvent::Route(event) => {
+            let route_evidence_fingerprint = json_route_evidence_fingerprint(&event);
+            let activity_event =
+                latest_activity(&event, load_last_signer_activity_cached(options, cache)?);
+            let stale = event_is_stale(&activity_event, options.max_observer_staleness);
+            let input_key = sha256(&json!({
+                "routeEvidenceFingerprint":route_evidence_fingerprint,
+                "routeSignature":event.get("signature").cloned().unwrap_or(Value::Null),
+                "routeObservedAt":event.get("observedAt").cloned().unwrap_or(Value::Null),
+                "activitySignature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
+                "activityObservedAt":activity_event.get("observedAt").cloned().unwrap_or(Value::Null),
+            }));
+            if cache.last_input_key.as_deref() == Some(input_key.as_str())
+                && cache.last_input_stale == Some(stale)
+            {
+                return Ok(());
+            }
+            let result = build_route(options, event, activity_event, stale);
+            if result.is_ok() {
+                cache.last_input_key = Some(input_key);
+                cache.last_input_stale = Some(stale);
+            }
+            result
+        }
+    }
+}
+
+fn build_route(options: &Options, event: Value, activity_event: Value, stale: bool) -> Result<()> {
     let (
         markets_path,
         route_path,
@@ -1056,23 +1237,8 @@ fn build(options: &Options) -> Result<()> {
         bridge_state_path,
         observer_state_path,
     ) = status_paths(&options.root);
-    let event = match load_latest_event(&options.events)? {
-        LatestEvent::Route(event) => event,
-        LatestEvent::NoRouteEvidence {
-            events_file_present,
-        } => {
-            publish_no_route_evidence_status(options, &status_path, events_file_present)?;
-            return Ok(());
-        }
-    };
     let source = source_for(&event);
     let route_evidence_fingerprint = json_route_evidence_fingerprint(&event);
-    // A latest LAST-signed activity can be a housekeeping instruction (for
-    // example setLoadedAccounts) which contains no route metadata. It renews
-    // only the lifecycle lease; the route below remains the last fully
-    // validated matched NotArb route.
-    let activity_event = latest_activity(&event, load_last_signer_activity(&options.activity)?);
-    let stale = event_is_stale(&activity_event, options.max_observer_staleness);
     let observer = observer_for(&activity_event, &event, &route_evidence_fingerprint, stale);
     let activity = json!({
         "signature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
@@ -1415,10 +1581,14 @@ fn build(options: &Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn fixture_directory(name: &str) -> PathBuf {
+        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         env::temp_dir().join(format!(
-            "last-route-bridge-{name}-{}-{}",
+            "last-route-bridge-{name}-{}-{}-{sequence}",
             process::id(),
             now_ms()
         ))
@@ -1426,6 +1596,7 @@ mod tests {
 
     fn offline_options(root: PathBuf, events: PathBuf) -> Options {
         Options {
+            route_receipt: root.join("last-grpc-route.json"),
             activity: root.join("last-grpc-activity.json"),
             root,
             events,
@@ -2028,6 +2199,115 @@ mod tests {
             .expect("repeated held status exists");
         assert_eq!(first_status, second_status);
         assert_no_active_outputs(&directory);
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn route_receipt_is_authoritative_over_malformed_historical_jsonl() {
+        let directory = fixture_directory("receipt-priority");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        // This completed malformed line would be a bridge error if the
+        // implementation scanned historical JSONL before the latest receipt.
+        fs::write(&events, "{malformed-json}\n").expect("write malformed history");
+        let options = offline_options(directory.clone(), events);
+        let receipt = fixture_route_event("receipt-route", "2020-01-01T00:00:00.000Z");
+        write_json_atomically(&options.route_receipt, &receipt).expect("write route receipt");
+
+        let mut cache = BridgeCache::default();
+        build_with_cache(&options, &mut cache).expect("receipt avoids JSONL scan");
+
+        let status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read held status")
+            .expect("held status exists");
+        assert_eq!(status.get("status"), Some(&json!("held")));
+        assert_eq!(status.get("reason"), Some(&json!("observer_stale")));
+        assert_eq!(
+            value_path(&status, &["source", "signature"]),
+            Some(&json!("receipt-route"))
+        );
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn malformed_route_receipt_holds_without_reviving_valid_history() {
+        let directory = fixture_directory("malformed-receipt");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events.clone());
+        let history = fixture_route_event("historical-route", &now_iso());
+        fs::write(&events, format!("{history}\n")).expect("write valid historical route");
+        // A completed bad receipt must hold. Falling back to `history` would
+        // attempt the offline RPC endpoint and accidentally reactivate it.
+        fs::write(&options.route_receipt, "{partial-receipt\n")
+            .expect("write malformed route receipt");
+
+        let mut cache = BridgeCache::default();
+        build_with_cache(&options, &mut cache).expect("malformed receipt holds safely");
+
+        let status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read held status")
+            .expect("held status exists");
+        assert_eq!(status.get("status"), Some(&json!("held")));
+        assert_eq!(status.get("reason"), Some(&json!("no_route_evidence")));
+        assert_no_active_outputs(&directory);
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn unchanged_route_receipt_does_not_churn_outputs_on_short_ticks() {
+        let directory = fixture_directory("receipt-cache");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events);
+        let receipt = fixture_route_event("receipt-cache-route", "2020-01-01T00:00:00.000Z");
+        write_json_atomically(&options.route_receipt, &receipt).expect("write route receipt");
+
+        let mut cache = BridgeCache::default();
+        build_with_cache(&options, &mut cache).expect("first receipt build");
+        let status_path = directory.join("last-target-status.json");
+        let first = fs::read(&status_path).expect("read first status");
+        build_with_cache(&options, &mut cache).expect("unchanged receipt build");
+        let second = fs::read(&status_path).expect("read second status");
+        assert_eq!(
+            first, second,
+            "an unchanged receipt must not rewrite status on every 250 ms tick"
+        );
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn jsonl_fallback_rechecks_when_the_route_receipt_is_missing() {
+        let directory = fixture_directory("jsonl-fallback-refresh");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events.clone());
+        let first = fixture_route_event("jsonl-route-one", "2020-01-01T00:00:00.000Z");
+        let second = fixture_route_event("jsonl-route-two", "2020-01-01T00:00:01.000Z");
+        fs::write(&events, format!("{first}\n")).expect("write first route evidence");
+
+        let mut cache = BridgeCache::default();
+        build_with_cache(&options, &mut cache).expect("first JSONL fallback build");
+        let status_path = directory.join("last-target-status.json");
+        let first_status = read_json_if_present(&status_path)
+            .expect("read first status")
+            .expect("first status exists");
+        assert_eq!(
+            value_path(&first_status, &["source", "signature"]),
+            Some(&json!("jsonl-route-one"))
+        );
+
+        // No compact receipt exists yet, so an appended JSONL route must not
+        // be masked by the receipt-cache fast path.
+        fs::write(&events, format!("{first}\n{second}\n")).expect("append second route evidence");
+        build_with_cache(&options, &mut cache).expect("refreshed JSONL fallback build");
+        let second_status = read_json_if_present(&status_path)
+            .expect("read refreshed status")
+            .expect("refreshed status exists");
+        assert_eq!(
+            value_path(&second_status, &["source", "signature"]),
+            Some(&json!("jsonl-route-two"))
+        );
         fs::remove_dir_all(&directory).expect("remove fixture directory");
     }
 

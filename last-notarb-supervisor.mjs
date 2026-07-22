@@ -273,6 +273,10 @@ async function currentEligibility() {
     eligible: true,
     activationKey: `${generation}:${activity.signature}`,
     generation,
+    // This advances only when the observer has a newly validated matched
+    // route. `lastSignature` may advance for generic setLoadedAccounts calls,
+    // which must keep the existing JVM warm instead of clearing its cache.
+    routeSignature: observer.lastRouteSignature,
     activity,
     targetMints: (route.targets ?? []).map((target) => target.mint).filter(Boolean),
     groupCount: markets.groups.length,
@@ -545,6 +549,7 @@ async function recoverOwnedChild() {
       processGroupId: IS_WINDOWS ? null : recordProcessGroupId(saved),
       activationKey: saved.activationKey ?? null,
       generation: saved.generation ?? null,
+      routeSignature: saved.routeSignature ?? null,
       startedAt: saved.startedAt ?? null,
       child: null,
       recovered: true,
@@ -567,6 +572,7 @@ function attachChildExit(child, record) {
       processGroupId: record.processGroupId ?? null,
       activationKey: record.activationKey,
       generation: record.generation,
+      routeSignature: record.routeSignature ?? null,
       exitCode: code,
       signal,
     }).catch((error) => announce('supervisor_state_write_error', { error: String(error.message ?? error) }, true));
@@ -606,6 +612,7 @@ async function startOwnedBot(eligibility) {
     processGroupId: IS_WINDOWS ? null : rootProcess.ProcessGroupId,
     activationKey: eligibility.activationKey,
     generation: eligibility.generation,
+    routeSignature: eligibility.routeSignature,
     startedAt: nowIso(),
     child,
     recovered: false,
@@ -619,12 +626,14 @@ async function startOwnedBot(eligibility) {
     processGroupId: record.processGroupId ?? null,
     activationKey: record.activationKey,
     generation: record.generation,
+    routeSignature: record.routeSignature,
     startedAt: record.startedAt,
   });
   announce('notarb_child_started', {
     rootPid: record.rootPid,
     activationKey: record.activationKey,
     generation: record.generation,
+    routeSignature: record.routeSignature,
     groupCount: eligibility.groupCount,
     targetMints: eligibility.targetMints,
     preflight: assertResult,
@@ -661,6 +670,7 @@ async function stopOwnedBot(reason) {
     processGroupId: current.processGroupId ?? null,
     activationKey: current.activationKey,
     generation: current.generation,
+    routeSignature: current.routeSignature ?? null,
     stoppedAt: nowIso(),
     reason,
   });
@@ -696,7 +706,12 @@ async function reconcile() {
       }
       transientIneligibleSince = null;
       await stopOwnedBot(eligibility.reason);
-      announce('notarb_waiting', { reason: eligibility.reason });
+      // Preserve the concrete gate inputs in the local lifecycle log. A
+      // `notarb_waiting` line is otherwise insufficient to distinguish a
+      // missing route from a stale receipt, a generation mismatch, or an
+      // actual market-heartbeat issue when diagnosing why no send was built.
+      const { eligible: _eligible, reason: _reason, ...details } = eligibility;
+      announce('notarb_waiting', { reason: eligibility.reason, ...details });
       return;
     }
 
@@ -746,6 +761,7 @@ async function reconcile() {
           processGroupId: ownedBot.processGroupId ?? null,
           activationKey: ownedBot.activationKey,
           generation: ownedBot.generation,
+          routeSignature: ownedBot.routeSignature ?? null,
           startedAt: ownedBot.startedAt,
           recovered: ownedBot.recovered,
         });

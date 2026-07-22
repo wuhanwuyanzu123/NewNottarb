@@ -10,6 +10,7 @@
     "supervise:last:live": "node ./last-notarb-supervisor.mjs --config=./notarb-last-grpc-live.toml --assert=./assert-last-live.mjs --runner=./run-notarb-last-target-live.cmd --state=./.last-notarb-live-supervisor-state.json",
     "supervise:last:live:linux": "bash ./run-last-notarb-live-supervisor.sh",
     "test:last:live-config": "node ./test-last-live-config.mjs",
+    "test:last:live-config-migration": "node ./test-migrate-last-live-config.mjs",
     "test:last:atomic-write": "node ./test-last-atomic-write.mjs",
     "test:last:supervisor": "node ./test-last-notarb-supervisor.mjs",
     "test:last:bridge": "node ./test-last-route-bridge.mjs"
