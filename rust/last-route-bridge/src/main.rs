@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     thread::sleep,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const WATCHED_ADDRESS: &str = "LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9";
@@ -20,6 +20,10 @@ const ADDRESS_LOOKUP_TABLE_PROGRAM: &str = "AddressLookupTab1e111111111111111111
 // The bridge read RPC rejects getMultipleAccounts payloads above 50 addresses.
 // Keep this read-path ceiling separate from any send-path limits.
 const MAX_GET_MULTIPLE_ACCOUNTS_ADDRESSES: usize = 50;
+// The supervisor treats the markets file mtime as a short liveness receipt.
+// Keep that tiny file fresh without re-reading the historical JSONL or
+// revalidating pools on every 250 ms bridge tick.
+const ACTIVE_MARKETS_HEARTBEAT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy)]
 struct PoolLayout {
@@ -131,6 +135,7 @@ struct BridgeCache {
     activity: Option<Value>,
     last_input_key: Option<String>,
     last_input_stale: Option<bool>,
+    last_markets_heartbeat: Option<Instant>,
 }
 
 fn main() {
@@ -897,6 +902,35 @@ fn status_paths(root: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf, Pa
     )
 }
 
+fn heartbeat_active_markets_if_due(options: &Options, cache: &mut BridgeCache) -> Result<()> {
+    if cache
+        .last_markets_heartbeat
+        .is_some_and(|last| last.elapsed() < ACTIVE_MARKETS_HEARTBEAT)
+    {
+        return Ok(());
+    }
+    let (markets_path, _, _, status_path, _, _) = status_paths(&options.root);
+    let status = read_json_if_present(&status_path)?;
+    if status.as_ref().and_then(|value| value.get("status")) != Some(&json!("active")) {
+        return Ok(());
+    }
+    let markets = read_json_if_present(&markets_path)?
+        .ok_or_else(|| anyhow!("active markets missing: {}", markets_path.display()))?;
+    let groups = markets.get("groups").cloned().unwrap_or(Value::Null);
+    if !usable_market_groups(Some(&groups)) {
+        return Err(anyhow!(
+            "active markets have no usable groups: {}",
+            markets_path.display()
+        ));
+    }
+    write_json_atomically(
+        &markets_path,
+        &json!({"update_timestamp":now_ms(),"groups":groups}),
+    )?;
+    cache.last_markets_heartbeat = Some(Instant::now());
+    Ok(())
+}
+
 fn publish_status(path: &Path, status: Value) -> Result<bool> {
     let changed = read_json_if_present(path)?
         .map(|previous| {
@@ -1216,12 +1250,16 @@ fn build_with_cache(options: &Options, cache: &mut BridgeCache) -> Result<()> {
             if cache.last_input_key.as_deref() == Some(input_key.as_str())
                 && cache.last_input_stale == Some(stale)
             {
+                if !stale {
+                    heartbeat_active_markets_if_due(options, cache)?;
+                }
                 return Ok(());
             }
             let result = build_route(options, event, activity_event, stale);
             if result.is_ok() {
                 cache.last_input_key = Some(input_key);
                 cache.last_input_stale = Some(stale);
+                cache.last_markets_heartbeat = Some(Instant::now());
             }
             result
         }
@@ -2272,6 +2310,50 @@ mod tests {
         assert_eq!(
             first, second,
             "an unchanged receipt must not rewrite status on every 250 ms tick"
+        );
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn active_market_heartbeat_refreshes_only_when_due() {
+        let directory = fixture_directory("markets-heartbeat");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events);
+        let (markets_path, _, _, status_path, _, _) = status_paths(&directory);
+        write_json_atomically(&status_path, &json!({"status":"active"}))
+            .expect("write active status");
+        write_json_atomically(
+            &markets_path,
+            &json!({"update_timestamp":1,"groups":[["pool-a","pool-b"]]}),
+        )
+        .expect("write active markets");
+
+        let mut cache = BridgeCache {
+            last_markets_heartbeat: Some(Instant::now() - ACTIVE_MARKETS_HEARTBEAT),
+            ..BridgeCache::default()
+        };
+        let before = fs::read(&markets_path).expect("read markets before heartbeat");
+        heartbeat_active_markets_if_due(&options, &mut cache).expect("refresh active heartbeat");
+        let refreshed = fs::read(&markets_path).expect("read refreshed markets");
+        assert_ne!(
+            before, refreshed,
+            "due heartbeat must rewrite markets timestamp"
+        );
+        let parsed = read_json_if_present(&markets_path)
+            .expect("parse refreshed markets")
+            .expect("refreshed markets exist");
+        assert_eq!(parsed.get("groups"), Some(&json!([["pool-a", "pool-b"]])));
+        assert!(parsed
+            .get("update_timestamp")
+            .and_then(Value::as_u64)
+            .is_some_and(|timestamp| timestamp > 1));
+
+        heartbeat_active_markets_if_due(&options, &mut cache).expect("short tick is a no-op");
+        assert_eq!(
+            refreshed,
+            fs::read(&markets_path).expect("read markets after short tick"),
+            "short ticks must not churn the markets file"
         );
         fs::remove_dir_all(&directory).expect("remove fixture directory");
     }
