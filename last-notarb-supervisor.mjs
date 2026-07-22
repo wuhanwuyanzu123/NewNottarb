@@ -204,13 +204,23 @@ async function currentEligibility() {
 
   const activity = status?.activity;
   if (!activity?.signature || !activity?.observedAt) return eligibleFailure('missing_validated_activity');
-  if (!observer?.lastRouteSignature || !observer?.lastRouteObservedAt) return eligibleFailure('missing_route_activity');
-  if (activity.signature !== observer.lastRouteSignature || activity.observedAt !== observer.lastRouteObservedAt) {
+  // The bridge writes this state before publishing a held status. Honor its
+  // explicit stale transition as well as the status-file mtime so a bridge
+  // crash in that short publication window never keeps an old child alive.
+  if (observer?.stale === true) return eligibleFailure('observer_stale');
+  if (observer?.stale !== false) return eligibleFailure('missing_observer_staleness');
+  // `last*` is the newest confirmed transaction sent by LAST itself. It may
+  // be a housekeeping instruction such as setLoadedAccounts. The separate
+  // `lastRoute*` fields remain the last validated matched NotArb route used
+  // for mints, DEXes, pools, and ALTs.
+  if (!observer?.lastSignature || !observer?.lastObservedAt) return eligibleFailure('missing_last_activity');
+  if (activity.signature !== observer.lastSignature || activity.observedAt !== observer.lastObservedAt) {
     return eligibleFailure('bridge_has_not_validated_current_activity', {
       activitySignature: activity.signature,
-      observerSignature: observer.lastRouteSignature,
+      observerSignature: observer.lastSignature,
     });
   }
+  if (!observer?.lastRouteSignature || !observer?.lastRouteObservedAt) return eligibleFailure('missing_route_activity');
   // `observedAt` is produced inside WSL while this supervisor uses the
   // Windows clock. The local status-file mtime is the host-clock receipt of
   // the bridge's active lease, so it is the reliable freshness source here.

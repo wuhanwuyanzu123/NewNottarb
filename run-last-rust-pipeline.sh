@@ -9,8 +9,9 @@ set -euo pipefail
 ROOT="${LAST_ROUTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 READ_RPC_URL="${LAST_READ_RPC_URL:-http://127.0.0.1:18899}"
 # NotArb needs time to load the user, prices, markets, and ALT set before it
-# can quote. Retain a validated LAST route for two minutes after the final
-# qualifying event, then publish `held` and let the supervisor stop its child.
+# can quote. Retain the last validated LAST route while confirmed
+# LAST-signed activity continues, then publish `held` two minutes after that
+# activity stops and let the supervisor stop its child.
 OBSERVER_STALENESS_SECONDS="${LAST_OBSERVER_STALENESS_SECONDS:-120}"
 NODE_BIN="${NODE_BIN:-}"
 if [[ -z "$NODE_BIN" ]]; then

@@ -19,6 +19,7 @@ import Client, { CommitmentLevel } from '@triton-one/yellowstone-grpc';
 import { appendFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import process from 'node:process';
+import { writeJsonAtomically } from './last-atomic-write.mjs';
 
 const WATCHED_ADDRESS = 'LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9';
 const NOTARB_PROGRAM = 'NA247a7YE9S3p9CdKmMyETx8TTwbSdVbVYHHxpnHTUV';
@@ -52,6 +53,11 @@ const ROOT = resolve(args.get('root') ?? process.cwd());
 // skips the large Windows-replace state snapshot entirely.
 const STATE_PATH = args.has('no-state') ? null : resolve(ROOT, args.get('state') ?? '.last-grpc-state.json');
 const EVENTS_PATH = resolve(ROOT, 'last-grpc-events.jsonl');
+// This is intentionally a tiny latest-value record rather than another full
+// transaction JSONL stream.  The route bridge uses it only to decide whether
+// LAST itself is still sending transactions; it never derives a mint, DEX,
+// pool, or ALT from this file.
+const ACTIVITY_PATH = resolve(ROOT, 'last-grpc-activity.json');
 const ALT_USES_PATH = resolve(ROOT, 'last-grpc-alt-uses.jsonl');
 const SUMMARIES_PATH = resolve(ROOT, 'last-grpc-summaries.jsonl');
 const ERRORS_PATH = resolve(ROOT, 'last-grpc-errors.jsonl');
@@ -532,6 +538,34 @@ function isStartableRouteEvidence(event) {
   );
 }
 
+function isLastSignerActivity(event) {
+  return Boolean(
+    event.success
+    && event.watch?.address === WATCHED_ADDRESS
+    && (event.watch?.isSigner || event.watch?.feePayer === WATCHED_ADDRESS)
+    && event.signature
+    && event.observedAt,
+  );
+}
+
+async function publishLastSignerActivity(event) {
+  if (!isLastSignerActivity(event)) return false;
+  await writeJsonAtomically(ACTIVITY_PATH, {
+    schemaVersion: 1,
+    kind: 'last_signer_activity',
+    signature: event.signature,
+    slot: event.slot,
+    observedAt: event.observedAt,
+    success: true,
+    watch: {
+      address: WATCHED_ADDRESS,
+      feePayer: event.watch.feePayer ?? null,
+      isSigner: true,
+    },
+  });
+  return true;
+}
+
 function recordWindow(event) {
   state.window ??= newWindow();
   state.window.total += 1;
@@ -566,6 +600,11 @@ async function maybeEmitSummary(event) {
 }
 
 async function persistEvent(event) {
+  // Keep a compact liveness receipt for every confirmed transaction actually
+  // sent by LAST. `last-grpc-events.jsonl` intentionally de-duplicates quiet
+  // no-fill route snapshots, so it is not a reliable heartbeat for repetitive
+  // instructions such as setLoadedAccounts.
+  const activityPublished = await publishLastSignerActivity(event);
   const fingerprint = routeFingerprint(event);
   const routeChanged = fingerprint !== state.activeRoute;
   const newAltTables = event.addressLookupTables.filter((table) => !state.knownAltTables.has(table.address));
@@ -603,7 +642,7 @@ async function persistEvent(event) {
   recordWindow(event);
   const summaryEmitted = await maybeEmitSummary(event);
   await maybeSaveState(notable || summaryEmitted);
-  return { notable, summaryEmitted };
+  return { notable, summaryEmitted, activityPublished };
 }
 
 function compactEvent(event) {

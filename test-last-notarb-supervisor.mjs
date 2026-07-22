@@ -2,7 +2,7 @@
 // Offline lifecycle test.  It uses a local fake child, never NotArb or a
 // network endpoint, and proves start -> stay-running -> quiet-stop -> restart.
 
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { execFile, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -46,13 +46,17 @@ function activityRecord(signature, generation, fingerprint) {
   return { signature, generation, fingerprint, observedAt };
 }
 
-async function writeObserverActivity(activity) {
+async function writeObserverActivity(activity, routeActivity = activity, stale = false) {
   await writeJson(join(directory, '.last-grpc-state.json'), {
     schemaVersion: 4,
-    lastRouteSignature: activity.signature,
+    lastSignature: activity.signature,
+    lastSlot: '1',
+    lastObservedAt: activity.observedAt,
+    lastRouteSignature: routeActivity.signature,
     lastRouteSlot: '1',
-    lastRouteObservedAt: activity.observedAt,
-    lastRouteFingerprint: activity.fingerprint,
+    lastRouteObservedAt: routeActivity.observedAt,
+    lastRouteFingerprint: routeActivity.fingerprint,
+    stale,
   });
 }
 
@@ -76,6 +80,11 @@ async function writeMarketsHeartbeat(payloadAgeMs = bridgeClockSkewMs) {
     update_timestamp: Date.now() - payloadAgeMs,
     groups,
   });
+}
+
+async function expireStatusLease() {
+  const expired = new Date(Date.now() - 61_000);
+  await utimes(join(directory, 'last-target-status.json'), expired, expired);
 }
 
 async function writeActivity(signature, generation = 1, fingerprint = routeEvidenceFingerprint) {
@@ -217,7 +226,10 @@ exit "$STATUS"
     `--assert=${ASSERT}`,
     `--runner=${runnerPath}`,
     '--poll-ms=100',
-    '--idle-seconds=10',
+    // A long synthetic lease makes the test independent of slow CI filesystem
+    // scheduling. The quiet-stop assertion below expires its status mtime
+    // explicitly, exercising the same supervisor gate without a minute wait.
+    '--idle-seconds=60',
   ], { cwd: directory, windowsHide: true, stdio: 'pipe' });
   supervisor.stdout.on('data', (chunk) => { supervisorStdout += chunk; });
   supervisor.stderr.on('data', (chunk) => { supervisorStderr += chunk; });
@@ -231,19 +243,43 @@ exit "$STATUS"
   await waitUntil(() => supervisorStdout.includes('"reason":"evidence_unreadable"'), 'active_missing_evidence_gate');
   if (await startCount() !== 0) throw new Error('started_with_active_missing_evidence');
   await writeRoute(1, routeEvidenceFingerprint, 'fixture-route-source');
-  await writeActivity('activity-one');
+  const initialRouteActivity = await writeActivity('activity-one');
   await waitUntil(async () => (await startCount()) === 1, 'first_fake_child_start');
   if (await fixtureLog('runner-config.log') !== join(directory, 'notarb-last-grpc-dryrun.toml')) throw new Error('runner_received_different_config_than_supervisor_validated');
   if (await fixtureLog('runner-supervisor.log') !== '--managed-by-last-supervisor') throw new Error('runner_missing_supervisor_lifecycle_marker');
   // The JSON payload timestamp belongs to the markets schema and may be on the
   // WSL clock. A freshly written local file with an intentionally old payload
   // must stay live; the supervisor gates on the host mtime.
+  // The bridge renews the active status together with the markets heartbeat.
+  // Refresh it here before the cadence gap so this assertion does not depend
+  // on time spent in the setup assertions above.
+  await writeActiveStatus(initialRouteActivity);
   await writeMarketsHeartbeat(60_000);
   await waitUntil(async () => (await supervisorPhase()) === 'running' && (await startCount()) === 1, 'host_mtime_heartbeat_keeps_running');
   // A five-second bridge cadence plus the modeled eight-second WSL clock skew
   // must remain a live lease under the default 20-second heartbeat tolerance.
   await pause(5_500);
   if (await supervisorPhase() !== 'running' || await startCount() !== 1) throw new Error('stopped_during_skewed_bridge_heartbeat_gap');
+  // A confirmed transaction actually signed by LAST can be an unrelated
+  // housekeeping instruction such as setLoadedAccounts. It must renew the
+  // lease while retaining the route evidence, generation, and one existing
+  // child rather than being misclassified as a new route.
+  let latestGenericActivity;
+  for (let index = 0; index < 3; index += 1) {
+    latestGenericActivity = activityRecord(`set-loaded-accounts-${index}`, 1, routeEvidenceFingerprint);
+    await writeObserverActivity(latestGenericActivity, initialRouteActivity);
+    await writeMarketsHeartbeat();
+    await writeActiveStatus(latestGenericActivity);
+    await pause(300);
+  }
+  const genericObserver = JSON.parse(await readFile(join(directory, '.last-grpc-state.json'), 'utf8'));
+  if (genericObserver.lastSignature !== latestGenericActivity.signature
+    || genericObserver.lastRouteSignature !== initialRouteActivity.signature) {
+    throw new Error('generic_last_activity_replaced_validated_route');
+  }
+  if (await supervisorPhase() !== 'running' || await startCount() !== 1) {
+    throw new Error('generic_last_activity_did_not_extend_existing_child');
+  }
   // Mirror the Rust unchanged-generation commit sequence: observer evidence
   // changes first, then the route automation fingerprint/markets, then active
   // status. The managed child must stay alive and see the route in place.
@@ -271,15 +307,22 @@ exit "$STATUS"
   await pause(500);
   if (await startCount() !== 1) throw new Error('duplicate_start_after_generation_rotation');
 
-  await waitUntil(async () => (await supervisorPhase()) === 'stopped', 'quiet_child_stop', 14_000);
+  await expireStatusLease();
+  await waitUntil(async () => (await supervisorPhase()) === 'stopped', 'quiet_child_stop');
   // Replaying the exact already-attempted generation/signature must not launch
   // a second child after a transient lease loss. A new LAST signature below is
   // what authorizes the next start.
   await writeActivity('activity-generation-two', 2, refreshedRouteEvidenceFingerprint);
   await pause(500);
   if (await supervisorPhase() !== 'stopped' || await startCount() !== 1) throw new Error('restarted_same_activity_after_quiet');
-  await writeActivity('activity-after-quiet', 2, refreshedRouteEvidenceFingerprint);
+  const postQuietActivity = await writeActivity('activity-after-quiet', 2, refreshedRouteEvidenceFingerprint);
   await waitUntil(async () => (await startCount()) === 2, 'second_fake_child_start');
+
+  // The bridge writes observer state before it publishes a held status. If it
+  // exits in that tiny window, the stale bit alone must stop the owned child;
+  // the supervisor must not wait for a stale status-file mtime.
+  await writeObserverActivity(postQuietActivity, postQuietActivity, true);
+  await waitUntil(async () => (await supervisorPhase()) === 'stopped', 'observer_stale_child_stop');
 
   await writeJson(join(directory, 'last-target-status.json'), { schemaVersion: 1, status: 'held', reason: 'fixture_stop' });
   await waitUntil(async () => (await supervisorPhase()) === 'stopped', 'held_child_stop');

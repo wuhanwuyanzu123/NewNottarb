@@ -61,6 +61,7 @@ const POOL_LAYOUTS: &[PoolLayout] = &[
 struct Options {
     root: PathBuf,
     events: PathBuf,
+    activity: PathBuf,
     rpc_url: String,
     interval: Duration,
     max_observer_staleness: Duration,
@@ -83,6 +84,15 @@ struct Account {
     address: String,
     owner: Option<String>,
     data: Option<Vec<u8>>,
+}
+
+// A generic LAST-signed transaction can renew a lifecycle lease only after a
+// normal route build has produced all of these matching artifacts.
+struct RetainedLease {
+    generation: u64,
+    active_fingerprint: String,
+    source: Value,
+    groups: Value,
 }
 
 // A missing JSONL file is normal while the observer is starting, and a JSONL
@@ -140,6 +150,11 @@ fn parse_options() -> Result<Options> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("last-grpc-events.jsonl"));
+    let activity = values
+        .get("activity")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("last-grpc-activity.json"));
     let rpc_url = values
         .get("rpc")
         .and_then(Value::as_str)
@@ -164,6 +179,7 @@ fn parse_options() -> Result<Options> {
     Ok(Options {
         root,
         events,
+        activity,
         rpc_url,
         interval: Duration::from_millis(interval_ms),
         max_observer_staleness: Duration::from_secs(staleness_seconds),
@@ -273,6 +289,51 @@ fn load_latest_event(path: &Path) -> Result<LatestEvent> {
     })
 }
 
+// The observer writes this lightweight receipt for each confirmed transaction
+// sent by LAST itself.  It is deliberately not route evidence: route evidence
+// still requires a matched NotArb instruction plus an explicit mint and DEX.
+fn is_last_signer_activity(activity: &Value) -> bool {
+    activity.get("success").and_then(Value::as_bool) == Some(true)
+        && value_path(activity, &["watch", "address"]).and_then(Value::as_str)
+            == Some(WATCHED_ADDRESS)
+        && (value_path(activity, &["watch", "isSigner"]).and_then(Value::as_bool) == Some(true)
+            || value_path(activity, &["watch", "feePayer"]).and_then(Value::as_str)
+                == Some(WATCHED_ADDRESS))
+        && activity
+            .get("signature")
+            .and_then(Value::as_str)
+            .is_some_and(|signature| !signature.is_empty())
+        && observed_at(activity).is_some()
+}
+
+fn load_last_signer_activity(path: &Path) -> Result<Option<Value>> {
+    Ok(read_json_if_present(path)?.filter(is_last_signer_activity))
+}
+
+fn observed_at(value: &Value) -> Option<chrono::DateTime<Utc>> {
+    string_path(value, &["observedAt"])
+        .and_then(|observed| chrono::DateTime::parse_from_rfc3339(&observed).ok())
+        .map(|observed| observed.with_timezone(&Utc))
+}
+
+// Preserve compatibility with a fresh qualifying route when the observer has
+// not yet written its compact liveness receipt. Otherwise take the newest
+// LAST-signed activity, which can be a non-route instruction such as
+// setLoadedAccounts.
+fn latest_activity(route: &Value, signer_activity: Option<Value>) -> Value {
+    match signer_activity {
+        Some(activity)
+            if observed_at(&activity)
+                .zip(observed_at(route))
+                .is_some_and(|(activity_at, route_at)| activity_at >= route_at) =>
+        {
+            activity
+        }
+        Some(activity) if observed_at(route).is_none() => activity,
+        _ => route.clone(),
+    }
+}
+
 fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut values: Vec<String> = values.into_iter().collect();
     values.sort();
@@ -368,28 +429,32 @@ fn source_for(event: &Value) -> Value {
     })
 }
 
-fn observer_for(event: &Value, fingerprint: &str, stale: bool) -> Value {
+fn observer_for(activity: &Value, route: &Value, fingerprint: &str, stale: bool) -> Value {
     json!({
-        "lastObservedAt":event.get("observedAt").cloned().unwrap_or(Value::Null),
-        "lastSignature":event.get("signature").cloned().unwrap_or(Value::Null),
-        "lastSlot":event.get("slot").cloned().unwrap_or(Value::Null),
+        "lastObservedAt":activity.get("observedAt").cloned().unwrap_or(Value::Null),
+        "lastSignature":activity.get("signature").cloned().unwrap_or(Value::Null),
+        "lastSlot":activity.get("slot").cloned().unwrap_or(Value::Null),
+        "lastRouteObservedAt":route.get("observedAt").cloned().unwrap_or(Value::Null),
+        "lastRouteSignature":route.get("signature").cloned().unwrap_or(Value::Null),
+        "lastRouteSlot":route.get("slot").cloned().unwrap_or(Value::Null),
         "routeEvidenceFingerprint":fingerprint,
         "stale":stale,
     })
 }
 
-fn state_for(event: &Value, fingerprint: &str) -> Value {
+fn state_for(activity: &Value, route: &Value, fingerprint: &str, stale: bool) -> Value {
     json!({
         "schemaVersion":4,
         "seen":[],
-        "lastSlot":event.get("slot").cloned().unwrap_or(Value::Null),
-        "lastSignature":event.get("signature").cloned().unwrap_or(Value::Null),
-        "lastObservedAt":event.get("observedAt").cloned().unwrap_or(Value::Null),
-        "lastRouteSlot":event.get("slot").cloned().unwrap_or(Value::Null),
-        "lastRouteSignature":event.get("signature").cloned().unwrap_or(Value::Null),
-        "lastRouteObservedAt":event.get("observedAt").cloned().unwrap_or(Value::Null),
+        "lastSlot":activity.get("slot").cloned().unwrap_or(Value::Null),
+        "lastSignature":activity.get("signature").cloned().unwrap_or(Value::Null),
+        "lastObservedAt":activity.get("observedAt").cloned().unwrap_or(Value::Null),
+        "lastRouteSlot":route.get("slot").cloned().unwrap_or(Value::Null),
+        "lastRouteSignature":route.get("signature").cloned().unwrap_or(Value::Null),
+        "lastRouteObservedAt":route.get("observedAt").cloned().unwrap_or(Value::Null),
         "lastRouteFingerprint":fingerprint,
         "activeRoute":fingerprint,
+        "stale":stale,
         "knownAltTables":[],
         "window":{"startedAt":now_iso(),"total":0,"noFill":0,"fills":0,"failed":0,"other":0},
         "lastSummaryAt":0,
@@ -398,13 +463,10 @@ fn state_for(event: &Value, fingerprint: &str) -> Value {
 }
 
 fn event_is_stale(event: &Value, maximum: Duration) -> bool {
-    let Some(observed) = string_path(event, &["observedAt"]) else {
+    let Some(observed) = observed_at(event) else {
         return true;
     };
-    let Ok(observed) = chrono::DateTime::parse_from_rfc3339(&observed) else {
-        return true;
-    };
-    let age = Utc::now().signed_duration_since(observed.with_timezone(&Utc));
+    let age = Utc::now().signed_duration_since(observed);
     age.to_std().map_or(true, |age| age > maximum)
 }
 
@@ -625,12 +687,36 @@ fn write_json_atomically(path: &Path, value: &Value) -> Result<()> {
     write_text_atomically(path, &text)
 }
 
+// Deployment exposes generated runtime files through release-local symlinks.
+// POSIX rename replaces a symlink rather than its target, so resolve the
+// destination first and atomically replace the file under runtime-state.
+fn atomic_write_target(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let link =
+                fs::read_link(path).with_context(|| format!("read symlink {}", path.display()))?;
+            if link.is_absolute() {
+                Ok(link)
+            } else {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+                Ok(parent.join(link))
+            }
+        }
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
 fn write_text_atomically(path: &Path, text: &str) -> Result<()> {
-    let parent = path
+    let target = atomic_write_target(path)?;
+    let parent = target
         .parent()
-        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+        .ok_or_else(|| anyhow!("path has no parent: {}", target.display()))?;
     fs::create_dir_all(parent)?;
-    let name = path
+    let name = target
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("output");
@@ -643,7 +729,7 @@ fn write_text_atomically(path: &Path, text: &str) -> Result<()> {
     }
     let mut last_error = None;
     for attempt in 0..8 {
-        match fs::rename(&temporary, path) {
+        match fs::rename(&temporary, &target) {
             Ok(()) => return Ok(()),
             Err(error)
                 if matches!(
@@ -654,18 +740,20 @@ fn write_text_atomically(path: &Path, text: &str) -> Result<()> {
                 last_error = Some(error);
                 sleep(Duration::from_millis(20 * (attempt + 1) as u64));
             }
-            Err(error) => return Err(error).with_context(|| format!("replace {}", path.display())),
+            Err(error) => {
+                return Err(error).with_context(|| format!("replace {}", target.display()))
+            }
         }
     }
     // DrvFS/NTFS may temporarily refuse replace while a reader holds the old
     // path. The final overwrite avoids a permanent stalled route lease.
-    match fs::write(path, text) {
+    match fs::write(&target, text) {
         Ok(()) => {
             let _ = fs::remove_file(&temporary);
             Ok(())
         }
         Err(error) => {
-            Err(last_error.unwrap_or(error)).with_context(|| format!("write {}", path.display()))
+            Err(last_error.unwrap_or(error)).with_context(|| format!("write {}", target.display()))
         }
     }
 }
@@ -691,6 +779,16 @@ fn publish_status(path: &Path, status: Value) -> Result<bool> {
                     != value_path(&status, &["activity", "signature"])
                 || value_path(&previous, &["activity", "observedAt"])
                     != value_path(&status, &["activity", "observedAt"])
+                // A generic LAST signer heartbeat can stay the same while a
+                // newly observed qualified route refreshes the evidence
+                // fingerprint. Publish that transition too, otherwise the
+                // supervisor would compare the new route file to stale status
+                // evidence and stop its existing child.
+                || value_path(&previous, &["activity", "routeEvidenceFingerprint"])
+                    != value_path(&status, &["activity", "routeEvidenceFingerprint"])
+                || value_path(&previous, &["observer", "lastRouteSignature"])
+                    != value_path(&status, &["observer", "lastRouteSignature"])
+                || previous.get("generation") != status.get("generation")
         })
         .unwrap_or(true);
     if changed {
@@ -763,16 +861,25 @@ fn publish_no_route_evidence_status(
     Ok(())
 }
 
-fn publish_observer_state(path: &Path, event: &Value, fingerprint: &str) -> Result<bool> {
+fn publish_observer_state(
+    path: &Path,
+    activity: &Value,
+    route: &Value,
+    fingerprint: &str,
+    stale: bool,
+) -> Result<bool> {
     let changed = read_json_if_present(path)?
         .map(|previous| {
-            previous.get("lastRouteSignature") != event.get("signature")
-                || previous.get("lastRouteObservedAt") != event.get("observedAt")
+            previous.get("lastSignature") != activity.get("signature")
+                || previous.get("lastObservedAt") != activity.get("observedAt")
+                || previous.get("lastRouteSignature") != route.get("signature")
+                || previous.get("lastRouteObservedAt") != route.get("observedAt")
                 || previous.get("lastRouteFingerprint").and_then(Value::as_str) != Some(fingerprint)
+                || previous.get("stale").and_then(Value::as_bool) != Some(stale)
         })
         .unwrap_or(true);
     if changed {
-        write_json_atomically(path, &state_for(event, fingerprint))?;
+        write_json_atomically(path, &state_for(activity, route, fingerprint, stale))?;
     }
     Ok(changed)
 }
@@ -809,6 +916,137 @@ fn refresh_unchanged_route_automation(
     Ok(true)
 }
 
+// `source` remains the route that created the derived market generation. A
+// same-generation matched route can nevertheless refresh ALT indexes or route
+// evidence. Preserve that newest validated evidence separately so a later
+// generic signer activity can renew the lease without re-running route RPC.
+fn refresh_bridge_state_route_evidence(
+    path: &Path,
+    bridge_state: &Value,
+    event: &Value,
+    route_evidence_fingerprint: &str,
+) -> Result<Value> {
+    let mut refreshed = bridge_state.clone();
+    let state = refreshed
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("invalid bridge state: {}", path.display()))?;
+    let route_source = source_for(event);
+    let desired = [
+        (
+            "lastValidatedRouteSignature",
+            event.get("signature").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "lastValidatedRouteSlot",
+            event.get("slot").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "lastValidatedRouteObservedAt",
+            event.get("observedAt").cloned().unwrap_or(Value::Null),
+        ),
+        (
+            "lastValidatedRouteEvidenceFingerprint",
+            Value::String(route_evidence_fingerprint.to_owned()),
+        ),
+        ("lastValidatedRouteSource", route_source),
+    ];
+    let changed = desired
+        .iter()
+        .any(|(key, value)| state.get(*key) != Some(value));
+    if changed {
+        for (key, value) in desired {
+            state.insert(key.to_owned(), value);
+        }
+        state.insert("updatedAt".to_owned(), Value::String(now_iso()));
+        write_json_atomically(path, &refreshed)?;
+    }
+    Ok(refreshed)
+}
+
+fn usable_market_groups(groups: Option<&Value>) -> bool {
+    groups.and_then(Value::as_array).is_some_and(|groups| {
+        !groups.is_empty()
+            && groups.iter().all(|group| {
+                group.as_array().is_some_and(|addresses| {
+                    addresses.len() >= 2
+                        && addresses.iter().all(|address| {
+                            address.as_str().is_some_and(|address| !address.is_empty())
+                        })
+                })
+            })
+    })
+}
+
+fn empty_array_or_missing(value: Option<&Value>) -> bool {
+    match value.and_then(Value::as_array) {
+        None => true,
+        Some(items) => items.is_empty(),
+    }
+}
+
+// Generic LAST-signed activity deliberately reuses the existing route. It
+// must never cause a new route/ALT/pool derivation. Require that all persisted
+// route artifacts still describe exactly the latest validated route evidence
+// before issuing a renewed active lease.
+fn retained_lease(
+    route: &Value,
+    markets: &Value,
+    bridge_state: &Value,
+    prior_status: &Value,
+    route_event: &Value,
+    route_evidence_fingerprint: &str,
+) -> Option<RetainedLease> {
+    let generation = bridge_state.get("generation").and_then(Value::as_u64)?;
+    let active_fingerprint = bridge_state
+        .get("activeFingerprint")
+        .and_then(Value::as_str)?
+        .to_owned();
+    let source = bridge_state.get("source")?.clone();
+    if bridge_state.get("lastValidatedRouteSignature") != route_event.get("signature")
+        || value_path(bridge_state, &["lastValidatedRouteSource", "signature"])
+            != route_event.get("signature")
+        || bridge_state
+            .get("lastValidatedRouteEvidenceFingerprint")
+            .and_then(Value::as_str)
+            != Some(route_evidence_fingerprint)
+        || value_path(
+            bridge_state,
+            &["lastValidatedRouteSource", "watchedAddress"],
+        )
+        .and_then(Value::as_str)
+            != Some(WATCHED_ADDRESS)
+        || source.get("watchedAddress").and_then(Value::as_str) != Some(WATCHED_ADDRESS)
+        || value_path(route, &["source", "watchedAddress"]).and_then(Value::as_str)
+            != Some(WATCHED_ADDRESS)
+        || prior_status.get("status").and_then(Value::as_str) != Some("active")
+        || prior_status.get("generation").and_then(Value::as_u64) != Some(generation)
+        || prior_status.get("fingerprint").and_then(Value::as_str)
+            != Some(active_fingerprint.as_str())
+        || value_path(prior_status, &["activity", "routeEvidenceFingerprint"])
+            .and_then(Value::as_str)
+            != Some(route_evidence_fingerprint)
+        || value_path(prior_status, &["observer", "stale"]).and_then(Value::as_bool) != Some(false)
+        || value_path(route, &["automation", "generation"]).and_then(Value::as_u64)
+            != Some(generation)
+        || value_path(route, &["automation", "fingerprint"]).and_then(Value::as_str)
+            != Some(active_fingerprint.as_str())
+        || value_path(route, &["automation", "routeEvidenceFingerprint"]).and_then(Value::as_str)
+            != Some(route_evidence_fingerprint)
+        || route.get("selectedGroups") != markets.get("groups")
+        || !usable_market_groups(markets.get("groups"))
+        || !empty_array_or_missing(route.get("unsupportedCandidateDexPrograms"))
+        || !empty_array_or_missing(route.get("rejectedLookupTables"))
+    {
+        return None;
+    }
+    Some(RetainedLease {
+        generation,
+        active_fingerprint,
+        source,
+        groups: markets.get("groups")?.clone(),
+    })
+}
+
 fn build(options: &Options) -> Result<()> {
     let (
         markets_path,
@@ -829,15 +1067,26 @@ fn build(options: &Options) -> Result<()> {
     };
     let source = source_for(&event);
     let route_evidence_fingerprint = json_route_evidence_fingerprint(&event);
-    let stale = event_is_stale(&event, options.max_observer_staleness);
-    let observer = observer_for(&event, &route_evidence_fingerprint, stale);
+    // A latest LAST-signed activity can be a housekeeping instruction (for
+    // example setLoadedAccounts) which contains no route metadata. It renews
+    // only the lifecycle lease; the route below remains the last fully
+    // validated matched NotArb route.
+    let activity_event = latest_activity(&event, load_last_signer_activity(&options.activity)?);
+    let stale = event_is_stale(&activity_event, options.max_observer_staleness);
+    let observer = observer_for(&activity_event, &event, &route_evidence_fingerprint, stale);
     let activity = json!({
-        "signature":event.get("signature").cloned().unwrap_or(Value::Null),
-        "slot":event.get("slot").cloned().unwrap_or(Value::Null),
-        "observedAt":event.get("observedAt").cloned().unwrap_or(Value::Null),
+        "signature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
+        "slot":activity_event.get("slot").cloned().unwrap_or(Value::Null),
+        "observedAt":activity_event.get("observedAt").cloned().unwrap_or(Value::Null),
         "routeEvidenceFingerprint":route_evidence_fingerprint,
     });
-    publish_observer_state(&observer_state_path, &event, &route_evidence_fingerprint)?;
+    publish_observer_state(
+        &observer_state_path,
+        &activity_event,
+        &event,
+        &route_evidence_fingerprint,
+        stale,
+    )?;
     let bridge_state = read_json_if_present(&bridge_state_path)?;
     let active_target = bridge_state.as_ref().map(|state| {
         json!({
@@ -871,6 +1120,87 @@ fn build(options: &Options) -> Result<()> {
             "observer_stale",
             json!({"maxObserverStalenessMs":options.max_observer_staleness.as_millis()}),
         );
+    }
+    let activity_is_generic = activity_event.get("signature") != event.get("signature");
+    if activity_is_generic {
+        let route_is_current_generation = bridge_state
+            .as_ref()
+            .and_then(|state| state.get("lastValidatedRouteSignature"))
+            == event.get("signature")
+            && bridge_state
+                .as_ref()
+                .and_then(|state| state.get("lastValidatedRouteEvidenceFingerprint"))
+                .and_then(Value::as_str)
+                == Some(route_evidence_fingerprint.as_str());
+        if route_is_current_generation {
+            let lease = match (
+                read_json_if_present(&route_path),
+                read_json_if_present(&markets_path),
+                read_json_if_present(&status_path),
+                bridge_state.as_ref(),
+            ) {
+                (Ok(Some(route)), Ok(Some(markets)), Ok(Some(prior_status)), Some(state)) => {
+                    retained_lease(
+                        &route,
+                        &markets,
+                        state,
+                        &prior_status,
+                        &event,
+                        &route_evidence_fingerprint,
+                    )
+                }
+                _ => None,
+            };
+            let Some(lease) = lease else {
+                return hold(
+                    "validated_route_unavailable",
+                    json!({
+                        "activitySignature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
+                        "routeSignature":event.get("signature").cloned().unwrap_or(Value::Null),
+                    }),
+                );
+            };
+            // Do not regenerate route, ALT, or bridge state from a generic
+            // transaction. It merely keeps the exact already-validated group
+            // warm for NotArb and refreshes its market-file heartbeat.
+            write_json_atomically(
+                &markets_path,
+                &json!({"update_timestamp":now_ms(),"groups":lease.groups}),
+            )?;
+            let status = json!({
+                "status":"active",
+                "reason":"last_signer_activity",
+                "fingerprint":lease.active_fingerprint,
+                "generation":lease.generation,
+                "source":lease.source,
+                "observer":observer,
+                "activity":activity,
+            });
+            publish_status(&status_path, status)?;
+            println!(
+                "{}",
+                json!({
+                    "status":"target_activity_lease_extended",
+                    "activitySignature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
+                    "routeSignature":event.get("signature").cloned().unwrap_or(Value::Null),
+                    "generation":lease.generation,
+                })
+            );
+            return Ok(());
+        }
+        // A newer qualifying route must still pass the normal validation path
+        // below. A stale historical route may not be resurrected merely because
+        // a later generic activity exists.
+        if event_is_stale(&event, options.max_observer_staleness) {
+            return hold(
+                "validated_route_unavailable",
+                json!({
+                    "activitySignature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
+                    "routeSignature":event.get("signature").cloned().unwrap_or(Value::Null),
+                    "reason":"route_evidence_stale_before_validation",
+                }),
+            );
+        }
     }
     let unsupported = unsupported_dexes(&event);
     if !unsupported.is_empty() {
@@ -939,6 +1269,14 @@ fn build(options: &Options) -> Result<()> {
             &route_evidence_fingerprint,
             event.get("observedAt").cloned().unwrap_or(Value::Null),
         )?;
+        let refreshed_bridge_state = refresh_bridge_state_route_evidence(
+            &bridge_state_path,
+            bridge_state
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing bridge state for unchanged route"))?,
+            &event,
+            &route_evidence_fingerprint,
+        )?;
         write_json_atomically(
             &markets_path,
             &json!({"update_timestamp":now_ms(),"groups":groups}),
@@ -947,8 +1285,8 @@ fn build(options: &Options) -> Result<()> {
             "status":"active",
             "reason":"unchanged",
             "fingerprint":active_fingerprint,
-            "generation":bridge_state.as_ref().and_then(|state| state.get("generation")).cloned().unwrap_or(json!(1)),
-            "source":bridge_state.as_ref().and_then(|state| state.get("source")).cloned().unwrap_or(source),
+            "generation":refreshed_bridge_state.get("generation").cloned().unwrap_or(json!(1)),
+            "source":refreshed_bridge_state.get("source").cloned().unwrap_or(source),
             "observer":observer,
             "activity":activity,
         });
@@ -1034,6 +1372,11 @@ fn build(options: &Options) -> Result<()> {
             "generation":generation,
             "activeFingerprint":active_fingerprint,
             "source":source,
+            "lastValidatedRouteSignature":event.get("signature").cloned().unwrap_or(Value::Null),
+            "lastValidatedRouteSlot":event.get("slot").cloned().unwrap_or(Value::Null),
+            "lastValidatedRouteObservedAt":event.get("observedAt").cloned().unwrap_or(Value::Null),
+            "lastValidatedRouteEvidenceFingerprint":route_evidence_fingerprint,
+            "lastValidatedRouteSource":source_for(&event),
             "updatedAt":now_iso(),
         }),
     )?;
@@ -1083,6 +1426,7 @@ mod tests {
 
     fn offline_options(root: PathBuf, events: PathBuf) -> Options {
         Options {
+            activity: root.join("last-grpc-activity.json"),
             root,
             events,
             // A no-listener endpoint makes an accidental read-RPC call fail
@@ -1094,6 +1438,36 @@ mod tests {
             once: true,
             max_markets: 4,
         }
+    }
+
+    fn fixture_route_event(signature: &str, observed_at: &str) -> Value {
+        json!({
+            "watch":{"address":WATCHED_ADDRESS},
+            "success":true,
+            "signature":signature,
+            "slot":"1",
+            "notArb":{"matched":true},
+            "accountKeys":[{"pubkey":"fixture-pool","writable":true,"signer":false}],
+            "arbitrageIntent":{
+                "mints":[{"mint":WSOL_MINT}],
+                "dexPrograms":[{"programId":POOL_LAYOUTS[0].program_id,"label":POOL_LAYOUTS[0].label}],
+            },
+            "execution":{"kind":"no_fill","invokedPrograms":[]},
+            "addressLookupTables":[],
+            "observedAt":observed_at,
+        })
+    }
+
+    fn fixture_signer_activity(signature: &str, observed_at: &str) -> Value {
+        json!({
+            "schemaVersion":1,
+            "kind":"last_signer_activity",
+            "signature":signature,
+            "slot":"2",
+            "observedAt":observed_at,
+            "success":true,
+            "watch":{"address":WATCHED_ADDRESS,"feePayer":WATCHED_ADDRESS,"isSigner":true},
+        })
     }
 
     fn assert_no_active_outputs(directory: &Path) {
@@ -1199,6 +1573,365 @@ mod tests {
             market_groups(&[mint], &pools, 4),
             vec![vec!["meteora".to_owned(), "pump".to_owned()]]
         );
+    }
+
+    #[test]
+    fn signer_activity_accepts_last_set_loaded_accounts_but_not_inbound_or_failed_records() {
+        let valid = json!({
+            "schemaVersion":1,
+            "kind":"last_signer_activity",
+            "signature":"set-loaded-accounts",
+            "slot":"1",
+            "observedAt":now_iso(),
+            "success":true,
+            "watch":{"address":WATCHED_ADDRESS,"feePayer":WATCHED_ADDRESS,"isSigner":true},
+        });
+        assert!(is_last_signer_activity(&valid));
+
+        let mut inbound = valid.clone();
+        inbound["watch"]["isSigner"] = json!(false);
+        inbound["watch"]["feePayer"] = json!("another-fee-payer");
+        assert!(!is_last_signer_activity(&inbound));
+
+        let mut failed = valid;
+        failed["success"] = json!(false);
+        assert!(!is_last_signer_activity(&failed));
+    }
+
+    #[test]
+    fn latest_signer_activity_renews_lease_without_replacing_route_evidence() {
+        let route = json!({
+            "signature":"validated-route",
+            "slot":"1",
+            "observedAt":"2020-01-01T00:00:00.000Z",
+        });
+        let activity = json!({
+            "schemaVersion":1,
+            "kind":"last_signer_activity",
+            "signature":"set-loaded-accounts",
+            "slot":"2",
+            "observedAt":now_iso(),
+            "success":true,
+            "watch":{"address":WATCHED_ADDRESS,"feePayer":WATCHED_ADDRESS,"isSigner":true},
+        });
+        let selected = latest_activity(&route, Some(activity));
+        assert_eq!(
+            selected.get("signature"),
+            Some(&json!("set-loaded-accounts"))
+        );
+        assert_eq!(route.get("signature"), Some(&json!("validated-route")));
+    }
+
+    #[test]
+    fn status_updates_route_evidence_while_generic_activity_is_unchanged() {
+        let directory = fixture_directory("generic-activity-route-refresh");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let status_path = directory.join("last-target-status.json");
+        let first = json!({
+            "status":"active",
+            "reason":"unchanged",
+            "fingerprint":"same-derived-markets",
+            "generation":1,
+            "activity":{
+                "signature":"set-loaded-accounts",
+                "observedAt":"2026-07-22T00:00:00.000Z",
+                "routeEvidenceFingerprint":"old-route-evidence",
+            },
+            "observer":{"lastRouteSignature":"old-route"},
+        });
+        assert!(publish_status(&status_path, first).expect("publish first status"));
+        let refreshed = json!({
+            "status":"active",
+            "reason":"unchanged",
+            "fingerprint":"same-derived-markets",
+            "generation":1,
+            "activity":{
+                "signature":"set-loaded-accounts",
+                "observedAt":"2026-07-22T00:00:00.000Z",
+                "routeEvidenceFingerprint":"new-route-evidence",
+            },
+            "observer":{"lastRouteSignature":"new-route"},
+        });
+        assert!(publish_status(&status_path, refreshed).expect("publish refreshed status"));
+        let stored = read_json_if_present(&status_path)
+            .expect("read status")
+            .expect("status exists");
+        assert_eq!(
+            value_path(&stored, &["activity", "routeEvidenceFingerprint"]),
+            Some(&json!("new-route-evidence"))
+        );
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn retained_lease_requires_exact_existing_validated_route() {
+        let fingerprint = "route-evidence";
+        let event = json!({"signature":"validated-route"});
+        let route = json!({
+            "source":{"watchedAddress":WATCHED_ADDRESS,"signature":"validated-route"},
+            "automation":{
+                "generation":3,
+                "fingerprint":"derived-markets",
+                "routeEvidenceFingerprint":fingerprint,
+            },
+            "selectedGroups":[["pool-a","pool-b"]],
+            "unsupportedCandidateDexPrograms":[],
+            "rejectedLookupTables":[],
+        });
+        let markets = json!({"groups":[["pool-a","pool-b"]]});
+        let state = json!({
+            "generation":3,
+            "activeFingerprint":"derived-markets",
+            "source":{"watchedAddress":WATCHED_ADDRESS,"signature":"validated-route"},
+            "lastValidatedRouteSignature":"validated-route",
+            "lastValidatedRouteEvidenceFingerprint":fingerprint,
+            "lastValidatedRouteSource":{"watchedAddress":WATCHED_ADDRESS,"signature":"validated-route"},
+        });
+        let status = json!({
+            "status":"active",
+            "generation":3,
+            "fingerprint":"derived-markets",
+            "activity":{"routeEvidenceFingerprint":fingerprint},
+            "observer":{"stale":false},
+        });
+        let lease = retained_lease(&route, &markets, &state, &status, &event, fingerprint)
+            .expect("matching route may be renewed");
+        assert_eq!(lease.generation, 3);
+        assert_eq!(lease.groups, json!([["pool-a", "pool-b"]]));
+
+        let newer_route = json!({"signature":"new-qualified-route"});
+        assert!(
+            retained_lease(&route, &markets, &state, &status, &newer_route, fingerprint).is_none(),
+            "a generic activity must not renew a route after new evidence appears"
+        );
+
+        let mut mismatched_source = state;
+        mismatched_source["lastValidatedRouteSource"]["signature"] = json!("wrong-route");
+        assert!(
+            retained_lease(
+                &route,
+                &markets,
+                &mismatched_source,
+                &status,
+                &event,
+                fingerprint,
+            )
+            .is_none(),
+            "a generic activity must not renew a route with inconsistent validated source"
+        );
+    }
+
+    #[test]
+    fn generic_activity_only_renews_active_r2_lease_without_rewriting_route_or_alt() {
+        let directory = fixture_directory("generic-retained-lease");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events.clone());
+        let route_one_observed = (Utc::now() - chrono::Duration::seconds(2))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let route_two_observed = (Utc::now() - chrono::Duration::seconds(1))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let route_one = fixture_route_event("route-r1", &route_one_observed);
+        let route_two = fixture_route_event("route-r2", &route_two_observed);
+        let route_evidence_fingerprint = json_route_evidence_fingerprint(&route_two);
+        let groups = json!([["pool-a", "pool-b"]]);
+        let active_fingerprint = "stable-derived-markets";
+
+        fs::write(&events, format!("{}\n", route_two)).expect("write latest matched route");
+        write_json_atomically(
+            &directory.join("last-target-route.json"),
+            &json!({
+                "source":{
+                    "watchedAddress":WATCHED_ADDRESS,
+                    "signature":"route-r1",
+                    "slot":"1",
+                    "observedAt":route_one_observed,
+                },
+                "automation":{
+                    "generation":7,
+                    "fingerprint":active_fingerprint,
+                    "routeEvidenceFingerprint":route_evidence_fingerprint,
+                },
+                "selectedGroups":groups,
+                "unsupportedCandidateDexPrograms":[],
+                "rejectedLookupTables":[],
+            }),
+        )
+        .expect("write retained route");
+        write_json_atomically(
+            &directory.join("last-target-markets.json"),
+            &json!({"update_timestamp":1,"groups":groups}),
+        )
+        .expect("write retained markets");
+        fs::write(
+            directory.join("last-target-lookup-tables.txt"),
+            "route-r1-alt\n",
+        )
+        .expect("write retained lookup tables");
+        let bridge_state_path = directory.join(".last-route-bridge-state.json");
+        let bridge_state = json!({
+            "schemaVersion":1,
+            "generation":7,
+            "activeFingerprint":active_fingerprint,
+            "source":source_for(&route_one),
+            "lastValidatedRouteSignature":"route-r1",
+            "lastValidatedRouteSlot":"1",
+            "lastValidatedRouteObservedAt":route_one_observed,
+            "lastValidatedRouteEvidenceFingerprint":json_route_evidence_fingerprint(&route_one),
+            "lastValidatedRouteSource":source_for(&route_one),
+        });
+        write_json_atomically(&bridge_state_path, &bridge_state).expect("write bridge state r1");
+        let refreshed_state = refresh_bridge_state_route_evidence(
+            &bridge_state_path,
+            &bridge_state,
+            &route_two,
+            &route_evidence_fingerprint,
+        )
+        .expect("refresh same-generation route r2");
+        assert_eq!(
+            refreshed_state
+                .get("source")
+                .and_then(|source| source.get("signature")),
+            Some(&json!("route-r1")),
+            "derived generation keeps its original source"
+        );
+        assert_eq!(
+            refreshed_state.get("lastValidatedRouteSignature"),
+            Some(&json!("route-r2"))
+        );
+        write_json_atomically(
+            &directory.join("last-target-status.json"),
+            &json!({
+                "status":"active",
+                "reason":"unchanged",
+                "fingerprint":active_fingerprint,
+                "generation":7,
+                "source":source_for(&route_one),
+                "observer":{"stale":false,"lastRouteSignature":"route-r2"},
+                "activity":{"signature":"prior-activity","observedAt":route_two_observed,"routeEvidenceFingerprint":route_evidence_fingerprint},
+            }),
+        )
+        .expect("write active r2 status");
+        let route_before =
+            fs::read(directory.join("last-target-route.json")).expect("read route before");
+        let lookup_before =
+            fs::read(directory.join("last-target-lookup-tables.txt")).expect("read lookup before");
+        let bridge_before = fs::read(&bridge_state_path).expect("read bridge state before");
+
+        write_json_atomically(
+            &options.activity,
+            &fixture_signer_activity("set-loaded-r2", &now_iso()),
+        )
+        .expect("write generic activity");
+        build(&options).expect("generic activity must not call offline RPC");
+
+        assert_eq!(
+            fs::read(directory.join("last-target-route.json")).expect("read route after"),
+            route_before,
+            "generic activity must not rewrite route"
+        );
+        assert_eq!(
+            fs::read(directory.join("last-target-lookup-tables.txt")).expect("read lookup after"),
+            lookup_before,
+            "generic activity must not rewrite ALT file"
+        );
+        assert_eq!(
+            fs::read(&bridge_state_path).expect("read bridge state after"),
+            bridge_before,
+            "generic activity must not rewrite bridge state"
+        );
+        let active_status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read active status")
+            .expect("active status exists");
+        assert_eq!(active_status.get("status"), Some(&json!("active")));
+        assert_eq!(
+            value_path(&active_status, &["activity", "signature"]),
+            Some(&json!("set-loaded-r2"))
+        );
+        assert_eq!(
+            value_path(&active_status, &["observer", "stale"]),
+            Some(&json!(false))
+        );
+
+        // Once the bridge has held the lease, later generic activity may not
+        // resurrect the historical group. A fresh matched route is required.
+        write_json_atomically(
+            &directory.join("last-target-status.json"),
+            &json!({
+                "status":"held",
+                "reason":"observer_stale",
+                "fingerprint":active_fingerprint,
+                "generation":7,
+                "observer":{"stale":true},
+                "activity":{"signature":"set-loaded-r2","observedAt":now_iso(),"routeEvidenceFingerprint":route_evidence_fingerprint},
+            }),
+        )
+        .expect("write held status");
+        let markets_before_held_generic = fs::read(directory.join("last-target-markets.json"))
+            .expect("read markets before held generic");
+        write_json_atomically(
+            &options.activity,
+            &fixture_signer_activity("set-loaded-after-held", &now_iso()),
+        )
+        .expect("write generic activity after held");
+        build(&options).expect("held generic activity must not call offline RPC");
+        let held_status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read held status")
+            .expect("held status exists");
+        assert_eq!(held_status.get("status"), Some(&json!("held")));
+        assert_eq!(
+            held_status.get("reason"),
+            Some(&json!("validated_route_unavailable"))
+        );
+        assert_eq!(
+            fs::read(directory.join("last-target-markets.json"))
+                .expect("read markets after held generic"),
+            markets_before_held_generic,
+            "held generic activity must not heartbeat old markets"
+        );
+        assert_eq!(
+            fs::read(directory.join("last-target-route.json")).expect("read held route"),
+            route_before
+        );
+        assert_eq!(
+            fs::read(directory.join("last-target-lookup-tables.txt")).expect("read held lookup"),
+            lookup_before
+        );
+        assert_eq!(
+            fs::read(&bridge_state_path).expect("read held bridge state"),
+            bridge_before
+        );
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writer_preserves_release_to_runtime_symlink() {
+        let directory = fixture_directory("runtime-symlink");
+        let release = directory.join("release");
+        let runtime = directory.join("runtime-state");
+        fs::create_dir_all(&release).expect("create release directory");
+        fs::create_dir_all(&runtime).expect("create runtime directory");
+        let target = runtime.join("last-target-status.json");
+        fs::write(&target, "{\"old\":true}\n").expect("write old runtime state");
+        let release_path = release.join("last-target-status.json");
+        std::os::unix::fs::symlink(&target, &release_path).expect("create release symlink");
+
+        write_json_atomically(&release_path, &json!({"new":true}))
+            .expect("write through release symlink");
+
+        assert!(
+            fs::symlink_metadata(&release_path)
+                .expect("inspect release path")
+                .file_type()
+                .is_symlink(),
+            "atomic replacement must retain the release symlink"
+        );
+        let persisted = read_json_if_present(&target)
+            .expect("read runtime target")
+            .expect("runtime target exists");
+        assert_eq!(persisted.get("new"), Some(&json!(true)));
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
     }
 
     #[test]
@@ -1338,6 +2071,50 @@ mod tests {
             value_path(&status, &["observer", "routeEvidencePresent"]),
             Some(&json!(false))
         );
+        assert_no_active_outputs(&directory);
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn signer_activity_without_route_evidence_stays_held_without_read_rpc() {
+        let directory = fixture_directory("activity-without-route");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events.clone());
+        fs::write(
+            &events,
+            format!(
+                "{}\n",
+                json!({
+                    "watch":{"address":WATCHED_ADDRESS},
+                    "success":true,
+                    "notArb":{"matched":false},
+                    "accountKeys":[],
+                    "arbitrageIntent":{"mints":[],"dexPrograms":[]},
+                })
+            ),
+        )
+        .expect("write non-route event");
+        write_json_atomically(
+            &options.activity,
+            &json!({
+                "schemaVersion":1,
+                "kind":"last_signer_activity",
+                "signature":"set-loaded-accounts",
+                "slot":"1",
+                "observedAt":now_iso(),
+                "success":true,
+                "watch":{"address":WATCHED_ADDRESS,"feePayer":WATCHED_ADDRESS,"isSigner":true},
+            }),
+        )
+        .expect("write signer activity");
+
+        build(&options).expect("activity without a route is held, not an RPC error");
+        let status = read_json_if_present(&directory.join("last-target-status.json"))
+            .expect("read held status")
+            .expect("held status exists");
+        assert_eq!(status.get("status"), Some(&json!("held")));
+        assert_eq!(status.get("reason"), Some(&json!("no_route_evidence")));
         assert_no_active_outputs(&directory);
         fs::remove_dir_all(&directory).expect("remove fixture directory");
     }

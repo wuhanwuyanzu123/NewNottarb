@@ -23,6 +23,7 @@ services without a local SSH forward:
 82.39.215.201:10000 Yellowstone gRPC
   -> 82.23.138.51 /opt/notarb-last/current/grpc-last.mjs
   -> /var/lib/notarb-last/runtime-state/last-grpc-events.jsonl
+  -> /var/lib/notarb-last/runtime-state/last-grpc-activity.json (LAST signer heartbeat)
   -> compiled Rust bridge
   -> target route / markets / ALT / status files
   -> activity-gated NotArb supervisor
@@ -159,16 +160,22 @@ The normal lifecycle is:
    `.last-grpc-state.json.lastRoute*`.
 2. The bridge validates the route and publishes `status: "active"` with a
    matching activity signature, exact pool group, and route-specific ALT set.
-3. The supervisor starts one target-only dry-run child. It keeps that child
+   Later confirmed transactions signed by LAST, including
+   `setLoadedAccounts`, renew `last-grpc-activity.json` and keep this same
+   validated route lease alive; they never create a route from their own
+   account list.
+3. The supervisor starts one target-only NotArb child. It keeps that child
    running while LAST activity remains fresh.
-4. After 120 seconds without a new qualifying LAST route check, or immediately
-   on `held` or stale markets, the supervisor stops only the child tree it
-   created. A route/market publication mismatch gets at most a seven-second
-   coherence grace while the bridge atomically finishes the next generation.
+4. After 120 seconds without a new confirmed LAST-signed activity, or
+   immediately on `held` or stale markets, the supervisor stops only the child
+   tree it created. A route/market publication mismatch gets at most a
+   seven-second coherence grace while the bridge atomically finishes the next
+   generation.
 
-The supervisor does not revive a stale historical group. A fresh activity must
-pass the bridge gates again. During continuous activity, a validated route
-rotation updates the market/ALT files in place rather than creating duplicate
+The supervisor never derives a route from generic wallet activity: it requires
+one prior bridge-validated route and continues using its exact mint/DEX/pool/
+ALT set while LAST remains active. During continuous activity, a validated
+route rotation updates the market/ALT files in place rather than creating duplicate
 NotArb children. `npm run test:last:supervisor` is an offline fake-child test
 for this start → stay-running → quiet-stop → restart behavior;
 `npm run test:last:bridge` verifies the bridge ignores an unfinished JSONL tail
@@ -203,9 +210,10 @@ legacy Windows observer and bridge:
 wsl.exe -e bash /mnt/g/old-program/notarb/run-last-rust-pipeline.sh
 ```
 
-The observer runs with `--no-state`; the compiled Rust bridge owns the small
-`.last-grpc-state.json` lease used by the lifecycle supervisor. In the 82.23
-deployment, GitHub Actions supplies the compiled bridge at
+The observer runs with `--no-state`; it writes the tiny
+`last-grpc-activity.json` signer heartbeat while the compiled Rust bridge owns
+the `.last-grpc-state.json` route/lease record used by the lifecycle
+supervisor. In the 82.23 deployment, GitHub Actions supplies the compiled bridge at
 `/opt/notarb-last/current/bin/last-route-bridge`, while generated evidence is
 kept under `/var/lib/notarb-last/runtime-state` and linked into the release.
 
@@ -267,6 +275,8 @@ and ALT loaders continue to use the direct 82.39 read RPC.
 
 Git intentionally ignores the high-frequency runtime evidence:
 
+- `last-grpc-activity.json` — latest confirmed transaction signed by LAST,
+  used only to renew a validated-route lifecycle lease;
 - `last-grpc-events.jsonl` — full route/ALT/fill/failure snapshots;
 - `last-grpc-summaries.jsonl` — minute-level high-frequency summaries;
 - `last-grpc-alt-uses.jsonl` — selected ALT addresses;
