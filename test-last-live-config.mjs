@@ -74,8 +74,8 @@ try {
   await expectInvalid(
     'legacy_senders',
     config.replace(
-      'spam_senders = [{ rpc = "spam1", max_retries = 0, require_profit = true }]',
-      'senders = [{ id = "spam1", max_retries = 0, require_profit = true }]',
+      'spam_senders = [{ rpc = "spam1", max_retries = 0 }]',
+      'senders = [{ id = "spam1", max_retries = 0 }]',
     ),
     'must use spam_senders, not senders',
   );
@@ -101,8 +101,8 @@ try {
   await expectInvalid(
     'multiple_spam_senders',
     config.replace(
-      'spam_senders = [{ rpc = "spam1", max_retries = 0, require_profit = true }]',
-      'spam_senders = [{ rpc = "spam1", max_retries = 0, require_profit = true }, { rpc = "spam2", max_retries = 0, require_profit = true }]',
+      'spam_senders = [{ rpc = "spam1", max_retries = 0 }]',
+      'spam_senders = [{ rpc = "spam1", max_retries = 0 }, { rpc = "spam2", max_retries = 0 }]',
     ),
     'must use only rpc=spam1',
   );

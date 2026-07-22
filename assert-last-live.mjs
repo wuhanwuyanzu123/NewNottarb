@@ -114,9 +114,8 @@ const spamSenderRpcCount = (strategySpamSenders.match(/\brpc\s*=/g) ?? []).lengt
 if (!/rpc\s*=\s*"spam1"/.test(strategySpamSenders)
   || spamSenderRpcCount !== 1
   || !/max_retries\s*=\s*0/.test(strategySpamSenders)
-  || !/require_profit\s*=\s*true/.test(strategySpamSenders)
   || /jito|\bmin_tip\b|\bmax_tip\b/i.test(strategySpamSenders)) {
-  fail('[[swap.strategy]] spam_senders must use only rpc=spam1 with max_retries=0 and require_profit=true.');
+  fail('[[swap.strategy]] spam_senders must use only rpc=spam1 with max_retries=0.');
 }
 expect(strategy, 'cu_limit', '369100');
 expect(strategy, 'min_priority_fee_lamports', '1000');

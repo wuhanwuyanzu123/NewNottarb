@@ -289,7 +289,8 @@ enabled SOL strategy, and `[swap.strategy_defaults] flash_loan = true`; the
 sender/swap execution path remains enabled.
 It keeps `[notarb_markets] enabled = false`, loading only the current
 `last-target-markets.json` and `last-target-lookup-tables.txt` written by the
-LAST bridge. The profile keeps `require_profit = true`, a 1,000 ms cooldown,
+LAST bridge. The profile leaves optional `require_profit` at the v1.1.2
+default, keeps a 1,000 ms cooldown,
 and a 25,000-lamport priority-fee cap; ordinary RPC sends have no Jito tip.
 
 The live child starts only for a fresh bridge-validated LAST route and stops

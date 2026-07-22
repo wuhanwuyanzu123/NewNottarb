@@ -256,7 +256,8 @@ local development only.
 For NotArb v1.1.2, the ordinary-RPC sender is `[[spam_rpc]] spam1`; do not
 substitute `[[sender]]` / `senders` for this profile.
 `[[swap.strategy]].spam_senders` maps to it with `rpc = "spam1"`, keeps
-`require_profit = true`, and has no Jito tip. `token_accounts_checker.rpc_url`
+`max_retries = 0`, leaves optional `require_profit` to the v1.1.2 default, and
+has no Jito tip. `token_accounts_checker.rpc_url`
 must exactly match `[[spam_rpc]].url`, so the bot can enumerate its own token
 accounts through the same indexed Helius endpoint. Priority fees remain capped
 at 25,000 lamports and the cooldown is 1,000 ms. The blockhash, price, market,

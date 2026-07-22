@@ -78,4 +78,5 @@ max_priority_fee_lamports = 25000
 cooldown_ms = 1000
 # NotArb maps this to the [[spam_rpc]] id above. `senders` is for [[sender]]
 # profiles and leaves an ordinary spam RPC unresolved.
-spam_senders = [{ rpc = "spam1", max_retries = 0, require_profit = true }]
+# v1.1.2 defaults require_profit to true, so leave that optional field out.
+spam_senders = [{ rpc = "spam1", max_retries = 0 }]
