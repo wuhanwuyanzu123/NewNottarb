@@ -2,8 +2,8 @@
 // Guard the local LAST live runner. It checks that the process remains
 // target-only while explicitly enabling one ordinary Helius RPC sender and
 // flash loans. The recovered 82 reader supplies blockhash, price, market, and
-// ALT data; the token-account secondary-index check and ordinary spam sender
-// use the one private Helius endpoint.
+// ALT data; the token-account secondary-index check and ordinary sender use
+// the one private Helius endpoint.
 
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -40,6 +40,11 @@ const exactlyOne = (name) => {
   const entries = named(name);
   if (entries.length !== 1) fail(`Expected exactly one [${name}] section; found ${entries.length}.`);
   return entries[0];
+};
+const exactlyOneArrayTable = (name) => {
+  const entry = exactlyOne(name);
+  if (!entry.multi) fail(`Expected [[${name}]] array-of-tables section.`);
+  return entry;
 };
 const expect = (sectionValue, key, value) => {
   if (sectionValue.values.get(key) !== value) fail(`[${sectionValue.name}] ${key} must be ${value}.`);
@@ -96,33 +101,33 @@ for (const readRpcSection of ['blockhash_updater', 'price_updater', 'market_load
 exactlyOneEnabledPath('markets_file', 'last-target-markets.json');
 exactlyOneEnabledPath('lookup_tables_file', 'last-target-lookup-tables.txt');
 
-if (named('sender').length !== 0) fail('[[sender]] must be absent for the ordinary-RPC LAST profile.');
-const spamRpc = exactlyOne('spam_rpc');
-expect(spamRpc, 'enabled', 'true');
-expect(spamRpc, 'id', '"spam1"');
-const sendingRpcUrl = stringValue(spamRpc, 'url');
+if (named('spam_rpc').length !== 0) fail('[[spam_rpc]] is not accepted by the onchain-bot sender path.');
+const sender = exactlyOneArrayTable('sender');
+expect(sender, 'enabled', 'true');
+expect(sender, 'id', '"spam1"');
+const sendingRpcUrl = stringValue(sender, 'url');
 if (!isConfiguredHeliusMainnetRpc(sendingRpcUrl)) {
-  fail('[[spam_rpc]] url must be a configured Helius mainnet RPC endpoint.');
+  fail('[[sender]] url must be a configured Helius mainnet RPC endpoint.');
 }
 if (tokenAccountsRpc !== sendingRpcUrl) {
-  fail('[token_accounts_checker] rpc_url must exactly match the [[spam_rpc]] spam1 url.');
+  fail('[token_accounts_checker] rpc_url must exactly match the [[sender]] spam1 url.');
 }
 const swap = exactlyOne('swap');
 expect(swap, 'enabled', 'true');
 const defaults = exactlyOne('swap.strategy_defaults');
 expect(defaults, 'flash_loan', 'true');
-const strategy = exactlyOne('swap.strategy');
+const strategy = exactlyOneArrayTable('swap.strategy');
 expect(strategy, 'enabled', 'true');
-if (strategy.values.has('senders')) {
-  fail('[[swap.strategy]] must use spam_senders, not senders.');
+if (strategy.values.has('spam_senders')) {
+  fail('[[swap.strategy]] must use senders, not spam_senders.');
 }
-const strategySpamSenders = strategy.values.get('spam_senders') ?? '';
-const spamSenderRpcCount = (strategySpamSenders.match(/\brpc\s*=/g) ?? []).length;
-if (!/rpc\s*=\s*"spam1"/.test(strategySpamSenders)
-  || spamSenderRpcCount !== 1
-  || !/max_retries\s*=\s*0/.test(strategySpamSenders)
-  || /jito|\bmin_tip\b|\bmax_tip\b/i.test(strategySpamSenders)) {
-  fail('[[swap.strategy]] spam_senders must use only rpc=spam1 with max_retries=0.');
+const strategySenders = parseStrategySenders(strategy.values.get('senders') ?? '');
+if (strategySenders.get('id') !== '"spam1"'
+  || strategySenders.get('max_retries') !== '0'
+  || strategySenders.has('rpc')
+  || strategySenders.has('require_profit')
+  || [...strategySenders.keys()].some((key) => !['id', 'max_retries', 'preflight_commitment'].includes(key))) {
+  fail('[[swap.strategy]] senders must use only id=spam1 with max_retries=0.');
 }
 expect(strategy, 'cu_limit', '369100');
 expect(strategy, 'min_priority_fee_lamports', '1000');
@@ -132,7 +137,7 @@ expect(strategy, 'cooldown_ms', '1000');
 console.log(JSON.stringify({
   status: 'last_live_config_valid',
   configPath,
-  sender: spamRpc.values.get('id')?.replace(/^"|"$/g, '') ?? null,
+  sender: sender.values.get('id')?.replace(/^"|"$/g, '') ?? null,
   flashLoan: defaults.values.get('flash_loan') === 'true',
 }));
 
@@ -151,4 +156,24 @@ function integerValue(sectionValue, key) {
     fail(`[${sectionValue.name}] ${key} must be a safe TOML integer.`);
   }
   return parsed;
+}
+
+function parseStrategySenders(value) {
+  const text = value.trim();
+  if (!text.startsWith('[') || !text.endsWith(']')) {
+    fail('[[swap.strategy]] senders must use only id=spam1 with max_retries=0.');
+  }
+  const objects = [...text.matchAll(/\{([^{}]*)\}/g)];
+  if (objects.length !== 1 || text.replace(/\{[^{}]*\}/g, '').replace(/[\s,\[\]]/g, '') !== '') {
+    fail('[[swap.strategy]] senders must use only id=spam1 with max_retries=0.');
+  }
+  const values = new Map();
+  for (const rawField of objects[0][1].split(',').map((field) => field.trim()).filter(Boolean)) {
+    const field = rawField.match(/^([A-Za-z0-9_]+)\s*=\s*(.+)$/s);
+    if (!field || values.has(field[1])) {
+      fail('[[swap.strategy]] senders must use only id=spam1 with max_retries=0.');
+    }
+    values.set(field[1], field[2].trim());
+  }
+  return values;
 }

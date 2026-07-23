@@ -32,10 +32,10 @@ The current production reader/sender contract is:
    bridge. A standalone local runner derives it from the asserted blockhash
    section only when that environment value is absent. The endpoint is not a
    bridge CLI argument.
-3. `[token_accounts_checker]` and `[[spam_rpc]] spam1` share the private
-   indexed Helius endpoint for token-account index reads and ordinary-RPC
-   sending. The 82 reader excludes this bot from its token-account secondary
-   index.
+3. `[token_accounts_checker]` and one enabled `[[sender]]` with
+   `id = "spam1"` share the private indexed endpoint for token-account index
+   reads and ordinary-RPC sending. The 82 reader excludes this bot from its
+   token-account secondary index.
 
 Do not print, commit, put into a shell command, include in process arguments,
 or copy the private Helius endpoint into logs or documentation. The tracked
@@ -133,8 +133,8 @@ backoff immediately.
 
 The runtime reads Yellowstone from `82.39.215.201:10000` and uses
 `http://82.39.215.201:8899` for bridge and core NotArb reads. Its private
-Helius endpoint remains limited to token-account checking and the `spam1`
-ordinary-RPC sender. Treat a source commit as deployed only after its GitHub
+ordinary-RPC endpoint remains limited to token-account checking and the
+enabled `spam1` sender. Treat a source commit as deployed only after its GitHub
 Actions run succeeds and `/opt/notarb-last/current` resolves to the matching
 release directory.
 
@@ -187,9 +187,11 @@ release directory.
    `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
    `[lookup_table_loader]` exactly match `http://82.39.215.201:8899`. If a
    token-account error returns, confirm that `[token_accounts_checker]` and
-   `[[spam_rpc]]` use the same private indexed Helius endpoint. The live
-   profile uses `[[spam_rpc]]` plus `spam_senders`, omits `require_profit`, has
-   no Jito tip, and uses `threads = 0` as NotArb's dynamic executor setting.
+   the enabled `[[sender]]` use the same private indexed endpoint. The live
+   profile uses `[[sender]]` plus `senders`, omits `require_profit`, has no
+   Jito tip, and uses `threads = 0` as NotArb's dynamic executor setting. If
+   the child says `There are no enabled [[sender]] configs with id: spam1`,
+   repair the sender schema before diagnosing the RPC.
 
 ## 82.23.138.51 deployment target
 
@@ -226,13 +228,13 @@ When deployed, the server connects directly to `82.39.215.201:10000` for
 Yellowstone gRPC and to `http://82.39.215.201:8899` for core reads. The
 blockhash, price, market, and ALT loader sections must all use the 8899 reader,
 and the pipeline unit passes that same value to the Rust bridge without placing
-it in its command line. The token-account checker matches the private indexed Helius
-`[[spam_rpc]]` endpoint because the 82 reader does not index this bot wallet.
-For NotArb v1.1.2, `spam1` is
-selected through `[[spam_rpc]]` plus
-`spam_senders = [{ rpc = "spam1", ... }]`; it is the single ordinary Helius
-sending endpoint, not a `[[sender]]` / `senders` profile. There are no
-Windows/WSL observer processes or local SSH tunnels in this deployment.
+it in its command line. The token-account checker matches the private indexed
+`[[sender]]` endpoint because the 82 reader does not index this bot wallet.
+The production onchain-bot JAR selects `spam1` through one enabled
+`[[sender]]` plus `senders = [{ id = "spam1", ... }]`. The previous
+`[[spam_rpc]]` plus `spam_senders = [{ rpc = "spam1", ... }]` path does not
+resolve the onchain-bot sender and must not be present. There are no Windows/WSL
+observer processes or local SSH tunnels in this deployment.
 
 ## CI/CD deployment to 82.23
 
@@ -242,15 +244,17 @@ Windows/WSL observer processes or local SSH tunnels in this deployment.
 2. Create `/etc/notarb-last` with mode `0700`, then create
    `/etc/notarb-last/keypair.json` and
    `/etc/notarb-last/notarb-last-grpc-live.toml` as `root:root`, mode `0600`.
-    Start the live TOML from the tracked example, set the bot keypair, and keep
-    `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
-    `[lookup_table_loader]` at `http://82.39.215.201:8899`. Set
-    `[token_accounts_checker].rpc_url` and `[[spam_rpc]].url` to the same
-    private indexed Helius endpoint. Keep `[notarb_markets]` disabled and the
-    markets and ALT paths relative; the separate systemd observer remains on
-    Yellowstone gRPC `82.39.215.201:10000`. The live service maintains stable
-    `/etc/notarb-last` links. Do not commit this file, its private endpoint, or
-    the keypair.
+   Start the live TOML from the tracked example, set the bot keypair, and keep
+   `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
+   `[lookup_table_loader]` at `http://82.39.215.201:8899`. Set
+   `[token_accounts_checker].rpc_url` and the `url` in the one enabled
+   `[[sender]]` to the same private indexed endpoint. The strategy must select
+   that same sender with `senders = [{ id = "spam1", max_retries = 0 }]`; do not
+   leave `[[spam_rpc]]`, `spam_senders`, or `require_profit` in this profile.
+   Keep `[notarb_markets]` disabled and the markets and ALT paths relative; the
+   separate systemd observer remains on Yellowstone gRPC `82.39.215.201:10000`.
+   The live service maintains stable `/etc/notarb-last` links. Do not commit
+   this file, its private endpoint, or the keypair.
 3. For the first deployment only, place the matching NotArb JAR at
    `/opt/notarb-last/.notarb-1.1.2.jar`. The workflow verifies it and installs
    the private runtime copy under `/var/lib/notarb-last/`.
@@ -475,12 +479,53 @@ node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
 npm run supervise:last:live
 ```
 
-The profile has `transaction_executor.threads = 0`, which selects NotArb
-v1.1.2's dynamic cached executor thread pool. It has one ordinary Helius
-`[[spam_rpc]]` sender selected with `spam_senders = [{ rpc = "spam1", ... }]`
-(the NotArb v1.1.2 ordinary-RPC pair, rather than `[[sender]]` / `senders`), an
-enabled SOL strategy, and `[swap.strategy_defaults] flash_loan = true`; the
-sender/swap execution path remains enabled.
+### Sender-schema migration
+
+The production onchain-bot JAR requires one enabled `[[sender]]` and a matching
+`[[swap.strategy]].senders` entry. The ID is the join key. The required private
+live-profile shape is:
+
+```toml
+[[sender]]
+enabled = true
+id = "spam1"
+url = "<private ordinary-RPC endpoint>"
+
+[[swap.strategy]]
+senders = [{ id = "spam1", max_retries = 0 }]
+```
+
+Migrate a pre-existing private live TOML as follows, without printing its URL
+or keypair:
+
+1. Stop `notarb-last-live-supervisor.service` so it cannot launch a child with
+   a half-edited config.
+2. Preserve the existing private ordinary-RPC URL, but move it from the old
+   `[[spam_rpc]]` table into the enabled `[[sender]]` table with `id = "spam1"`.
+3. Replace `spam_senders = [{ rpc = "spam1", max_retries = 0 }]` with
+   `senders = [{ id = "spam1", max_retries = 0 }]`; remove all old
+   `[[spam_rpc]]` and `spam_senders` entries. Keep `require_profit` omitted.
+4. Run the non-printing migration and config assertion, then start the live
+   supervisor only after both pass. The CI deployment executes the same two
+   commands before activation:
+
+   ```bash
+   /usr/bin/node /opt/notarb-last/current/migrate-last-live-config.mjs \
+     /etc/notarb-last/notarb-last-grpc-live.toml
+   /usr/bin/node /opt/notarb-last/current/assert-last-live.mjs \
+     /etc/notarb-last/notarb-last-grpc-live.toml
+   systemctl restart notarb-last-live-supervisor.service
+   ```
+
+The prior `[[spam_rpc]]` / `spam_senders` combination follows a different
+sender path. In this JAR it leaves `senders` with no matching enabled
+`[[sender]]`, resulting in `There are no enabled [[sender]] configs with id:
+spam1` and no ordinary-RPC send.
+
+The profile has `transaction_executor.threads = 0`, which selects NotArb's
+dynamic cached executor thread pool. It has the enabled ordinary-RPC sender
+above, an enabled SOL strategy, and `[swap.strategy_defaults] flash_loan = true`;
+the sender/swap execution path remains enabled.
 It keeps `[notarb_markets] enabled = false`, loading only the current
 `last-target-markets.json` and `last-target-lookup-tables.txt` written by the
 LAST bridge. The profile omits `require_profit`, keeps a 1,000 ms cooldown,
@@ -493,10 +538,26 @@ when the lease becomes quiet, held, stale, or incoherent. Its logs are
 `last-notarb-live-supervisor.stdout.log` and
 `last-notarb-live-supervisor.stderr.log`.
 
-`[token_accounts_checker]` must match the private indexed Helius `[[spam_rpc]]`
-endpoint. `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
+`[token_accounts_checker]` must match the private indexed `[[sender]]` endpoint.
+`[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
 `[lookup_table_loader]` must all use `http://82.39.215.201:8899`. The 82 reader
 is intentionally excluded only from the bot-wallet token-account index path.
+
+### Runtime send verification
+
+Only a fresh bridge-validated `active` lease starts the Java child. Follow the
+current child interval, not accumulated historical output:
+
+```bash
+tail -F /var/lib/notarb-last/runtime-state/notarb-last-target-live.stdout.log \
+        /var/lib/notarb-last/runtime-state/notarb-last-target-live.stderr.log
+```
+
+`[markets_file] Groups: 1` confirms only that the target route loaded.
+`There are no enabled [[sender]] configs with id: spam1` confirms a schema
+mismatch. A real ordinary-RPC submission is established only by a new explicit
+transaction signature returned by the sender in that log interval. A quiet,
+held, stale, or incoherent lease normally has no child and no send attempt.
 
 No private material should ever be committed. `.gitignore` excludes the local
 run config, wallet JSON files, event data, logs, and dependencies.

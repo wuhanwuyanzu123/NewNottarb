@@ -32,18 +32,18 @@ services without a local SSH forward:
   -> systemd-pinned `LAST_READ_RPC_URL` for Rust market-state/ALT validation
   -> 82.23.138.51 NotArb blockhash, price, market, and ALT reader roles
 
-Private live TOML Helius endpoint
-  -> `token_accounts_checker` account-index reads and live `spam1`
-     `[[spam_rpc]]` transaction sending
+Private live TOML ordinary-RPC endpoint
+  -> `token_accounts_checker` account-index reads and live enabled `[[sender]]`
+     `spam1` transaction sending
 ```
 
 The four core NotArb reader roles are `[blockhash_updater]`,
 `[price_updater]`, `[market_loader]`, and `[lookup_table_loader]`. Production
 requires all four to use `http://82.39.215.201:8899`; the production pipeline
 unit pins that same value as `LAST_READ_RPC_URL` (a standalone local runner
-uses the asserted TOML fallback). `[token_accounts_checker]` and
-`[[spam_rpc]] spam1` instead share the private indexed Helius endpoint because
-the 82 reader excludes this bot from token-account secondary indexes. The
+uses the asserted TOML fallback). `[token_accounts_checker]` and the enabled
+`[[sender]]` with `id = "spam1"` instead share the private indexed endpoint
+because the 82 reader excludes this bot from token-account secondary indexes. The
 literal Helius endpoint stays only in the mode-`0600` live TOML: do not put it
 in command lines, process arguments, logs, examples, or committed
 documentation.
@@ -272,34 +272,51 @@ LAST activity key may launch the next child.
 Its local runnable copy is ignored by Git. It keeps the global scanner off and
 uses only the bridge-written `last-target-markets.json` plus its exact active
 ALT file. The profile uses `transaction_executor.threads = 0`, which selects
-NotArb v1.1.2's dynamic cached executor thread pool. Its ordinary Helius
-JSON-RPC sender (`[[spam_rpc]]`, referenced by
-`spam_senders = [{ rpc = "spam1", ... }]`), SOL strategy, and `flash_loan = true`
-remain enabled for live execution.
+NotArb's dynamic cached executor thread pool. Its ordinary JSON-RPC
+`[[sender]]`, SOL strategy, and `flash_loan = true` remain enabled for live
+execution.
 
-### v1.1.2 configuration contract
+### Production onchain-bot sender contract
 
-The deployed JAR is pinned to the official
-[`v1.1.2` distribution](https://github.com/NotArb/Release/releases/download/v1.1.2/notarb-1.1.2.tar.gz).
-Its bundled `onchain-bot/example.toml` pairs `[[spam_rpc]]` with
-`[[swap.strategy]].spam_senders`:
+The production onchain-bot JAR resolves
+`[[swap.strategy]].senders` against enabled `[[sender]]` entries. The live
+ordinary-RPC profile must use this pair:
 
 ```toml
-[[spam_rpc]]
+[[sender]]
+enabled = true
 id = "spam1"
-# Its endpoint is stored only in the private live TOML.
+url = "<private ordinary-RPC endpoint>"
 
 [[swap.strategy]]
-spam_senders = [{ rpc = "spam1", max_retries = 0 }]
+senders = [{ id = "spam1", max_retries = 0 }]
 ```
 
-Do not cross this with the distinct `[[sender]]` / `senders` schema. The
-deployment validates the v1.1.2 pair, omits `require_profit`, and requires the
-four core reader/load sections to use `http://82.39.215.201:8899`.
+`[[spam_rpc]]` / `spam_senders` is a separate path. It did not register an
+enabled `[[sender]]` for this production JAR, which produced
+`There are no enabled [[sender]] configs with id: spam1` and no send. Do not
+mix the two schemas. The ordinary-RPC entry keeps `max_retries = 0`; leave
+`require_profit` out. The deployment validates the `[[sender]]` / `senders`
+pair and requires the four core reader/load sections to use
+`http://82.39.215.201:8899`.
+
+The deployment migration performs this conversion without printing the private
+URL: it renames `[[spam_rpc]]` to an enabled `[[sender]]`, renames
+`spam_senders` to `senders`, changes the inner selector from `rpc` to `id`, and
+removes `require_profit`. For a manual repair, stop the live supervisor and run
+the same migration followed by the assertion before restarting:
+
+```bash
+/usr/bin/node /opt/notarb-last/current/migrate-last-live-config.mjs \
+  /etc/notarb-last/notarb-last-grpc-live.toml
+/usr/bin/node /opt/notarb-last/current/assert-last-live.mjs \
+  /etc/notarb-last/notarb-last-grpc-live.toml
+systemctl restart notarb-last-live-supervisor.service
+```
 
 ```powershell
 Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml
-notepad .\notarb-last-grpc-live.toml # set the local bot keypair and private Helius value
+notepad .\notarb-last-grpc-live.toml # set the local bot keypair and private ordinary-RPC URL
 node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
 npm run supervise:last:live
 ```
@@ -311,14 +328,26 @@ Java child absent; a fresh bridge-validated route starts one
 `run-notarb-last-target-live.sh` child. The Windows `.cmd` wrapper remains for
 local development only.
 
-For NotArb v1.1.2, the ordinary-RPC sender is `[[spam_rpc]] spam1`; do not
-substitute `[[sender]]` / `senders` for this profile.
-`[[swap.strategy]].spam_senders` maps to it with `rpc = "spam1"`, keeps
+The enabled `[[sender]] spam1` is selected by
+`[[swap.strategy]].senders` with `id = "spam1"`; it keeps
 `max_retries = 0`, omits `require_profit`, and has no Jito tip. The private
-Helius endpoint backs only `token_accounts_checker` and `[[spam_rpc]]`; all
-four core reader/load sections remain on `http://82.39.215.201:8899`. Priority
-fees remain capped at 25,000 lamports and the cooldown is
-1,000 ms.
+endpoint backs only `token_accounts_checker` and this `[[sender]]`; all four
+core reader/load sections remain on `http://82.39.215.201:8899`. Priority fees
+remain capped at 25,000 lamports and the cooldown is 1,000 ms.
+
+For runtime proof, follow a fresh live-child log interval rather than reading
+old accumulated output:
+
+```bash
+tail -F /var/lib/notarb-last/runtime-state/notarb-last-target-live.stdout.log \
+        /var/lib/notarb-last/runtime-state/notarb-last-target-live.stderr.log
+```
+
+`[markets_file] Groups: 1` proves only that the generated route loaded. A
+successful config assertion and the absence of the unresolved-sender error
+prove the sender wiring; an actual submission is proved only by a new explicit
+transaction signature returned by the sender. A quiet or held LAST lease
+normally has no Java child and therefore no send attempt.
 
 Each Linux live-child launch also starts a best-effort, non-blocking
 fee-payer preflight. It derives the public key from `[user].keypair_path`

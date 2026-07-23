@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Exercises the deployment-only migration without contacting an RPC or
-// starting NotArb.  It covers the exact hybrid configuration that previously
-// selected [[sender]] metadata for a v1.1.2 [[spam_rpc]].
+// starting NotArb. It covers the legacy spam-RPC profile that the v1.1.2
+// onchain-bot does not load into its [[sender]] map.
 
 import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -44,16 +44,21 @@ try {
   const configured = template
     .replace('REPLACE_WITH_DEDICATED_FUNDED_KEYPAIR.json', 'fixture-keypair.json')
     .replaceAll('https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY', heliusUrl);
-  // Model the deployed predecessor: direct reader URLs plus the old sender
-  // schema. Migration must keep the sender/token index direct but move the
-  // four core read roles to the recovered 82 reader.
+  // Model the deployed predecessor: direct reader URLs plus the old spam-RPC
+  // schema. Migration must preserve the private sender/token-index URL while
+  // moving the four core read roles to the recovered 82 reader.
   const hybrid = configured
     .replaceAll(readerUrl, heliusUrl)
     .replace('threads = 0', 'threads = 1')
     .replace('delay_ms = 1000', 'delay_ms = 250')
+    .replace(/^\[\[sender\]\]$/m, '[[spam_rpc]]')
     .replace(
-      'spam_senders = [{ rpc = "spam1", max_retries = 0 }]',
-      'senders = [{ id = "spam1", max_retries = 0, require_profit = true }]',
+      /^(\[\[spam_rpc\]\][\s\S]*?^url\s*=\s*"https:\/\/mainnet\.helius-rpc\.com\/\?api-key=fixture-indexed-key")/m,
+      '$1\nmax_idle_connections = 1',
+    )
+    .replace(
+      'senders = [{ id = "spam1", max_retries = 0 }]',
+      'spam_senders = [{ rpc = "spam1", max_retries = 0, require_profit = true }]',
     );
   await writeFile(join(directory, 'fixture-keypair.json'), '[]\n', 'utf8');
   await writeFile(configPath, hybrid, 'utf8');
@@ -63,6 +68,9 @@ try {
   if (migrated.code !== 0 || !migrated.stdout.includes('last_live_config_migrated_v1_1_2')) {
     throw new Error(`hybrid_profile_not_migrated:${migrated.stderr || migrated.stdout}`);
   }
+  if (`${migrated.stdout}${migrated.stderr}`.includes(heliusUrl)) {
+    throw new Error('migration_output_exposed_private_sender_url');
+  }
   if (!migrated.stdout.includes('blockhash_updater_delay_ms')) {
     throw new Error(`blockhash_delay_not_migrated:${migrated.stderr || migrated.stdout}`);
   }
@@ -70,11 +78,12 @@ try {
   for (const expected of [
     'threads = 0',
     'delay_ms = 1000',
-    'spam_senders = [ { rpc = "spam1", max_retries = 0 } ]',
+    '[[sender]]',
+    'senders = [ { id = "spam1", max_retries = 0 } ]',
   ]) {
     if (!migratedText.includes(expected)) throw new Error(`missing_expected_migration:${expected}`);
   }
-  for (const forbidden of ['senders = [{', 'id = "spam1", max_retries']) {
+  for (const forbidden of ['[[spam_rpc]]', 'spam_senders =', 'rpc = "spam1"', 'max_idle_connections']) {
     if (migratedText.includes(forbidden)) throw new Error(`hybrid_field_survived:${forbidden}`);
   }
   if (/require_profit\s*=/i.test(migratedText)) {
@@ -88,7 +97,7 @@ try {
     ? ''
     : tokenRest.slice(0, tokenEnd < 0 ? tokenRest.length : tokenEnd).join('\n');
   if (!tokenChecker.includes(`rpc_url = "${heliusUrl}"`)) {
-    throw new Error('token_checker_not_migrated_to_spam_rpc');
+    throw new Error('token_checker_not_migrated_to_sender');
   }
   for (const section of ['blockhash_updater', 'price_updater', 'market_loader', 'lookup_table_loader']) {
     const expression = new RegExp(`\\[${section.replace('.', '\\.') }\\][\\s\\S]*?rpc_url\\s*=\\s*"${readerUrl.replace(/[./]/g, '\\$&')}"`);
@@ -103,6 +112,18 @@ try {
   const idempotent = await run(process.execPath, migrationArgs);
   if (idempotent.code !== 0 || !idempotent.stdout.includes('last_live_config_already_v1_1_2')) {
     throw new Error(`migration_not_idempotent:${idempotent.stderr || idempotent.stdout}`);
+  }
+
+  // Ambiguous mixed schemas must fail without rewriting the private TOML.
+  const mixedPath = join(directory, 'mixed-live-config.toml');
+  const mixed = `${configured}\n[[spam_rpc]]\nenabled = true\nid = "spam1"\nurl = "${heliusUrl}"\n`;
+  await writeFile(mixedPath, mixed, 'utf8');
+  const mixedResult = await run(process.execPath, [migration, mixedPath]);
+  if (mixedResult.code === 0 || !`${mixedResult.stdout}${mixedResult.stderr}`.includes('contains both [[sender]] and legacy [[spam_rpc]]')) {
+    throw new Error(`mixed_schema_not_rejected:${mixedResult.stderr || mixedResult.stdout}`);
+  }
+  if (await readFile(mixedPath, 'utf8') !== mixed) {
+    throw new Error('mixed_schema_was_rewritten');
   }
 
   console.log(JSON.stringify({ status: 'last_live_config_migration_test_passed' }));

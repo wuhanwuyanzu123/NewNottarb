@@ -242,9 +242,10 @@ jobs:
           test -x "$staging/run-last-notarb-live-supervisor.sh"
           test -x "$staging/rust/last-route-bridge/run-wsl.sh"
           test -d "$staging/node_modules"
-          # The deployed JAR is NotArb v1.1.2. Its official distribution uses
-          # [[spam_rpc]] plus spam_senders; normalize the known old hybrid
-          # before asserting the private config, without printing its secret.
+          # The deployed JAR is NotArb v1.1.2. Its onchain-bot constructs
+          # [[sender]] entries and strategy senders; normalize the legacy
+          # spam-RPC profile before asserting the private config, without
+          # printing its secret.
           /usr/bin/node "$staging/migrate-last-live-config.mjs" "$config"
           /usr/bin/node "$staging/assert-last-live.mjs" "$config"
 

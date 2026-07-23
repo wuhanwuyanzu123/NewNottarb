@@ -62,9 +62,9 @@ try {
     .replaceAll('https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY', heliusUrl);
   await writeFile(join(directory, 'fixture-keypair.json'), '[]\n', 'utf8');
 
-  // The v1.1.2 ordinary-RPC profile is a [[spam_rpc]] paired with
-  // spam_senders. Core market readers use the recovered 82 reader; the token
-  // account checker and spam1 share the configured Helius URL. threads=0 is dynamic.
+  // The v1.1.2 onchain-bot maps [[sender]] entries and each strategy selects
+  // one through senders. Core market readers use the recovered 82 reader; the
+  // token account checker and spam1 share the configured Helius URL. threads=0 is dynamic.
   await expectValid(config);
 
   await expectInvalid(
@@ -80,12 +80,12 @@ try {
   );
 
   await expectInvalid(
-    'legacy_senders',
+    'legacy_spam_senders',
     config.replace(
-      'spam_senders = [{ rpc = "spam1", max_retries = 0 }]',
       'senders = [{ id = "spam1", max_retries = 0 }]',
+      'spam_senders = [{ rpc = "spam1", max_retries = 0 }]',
     ),
-    'must use spam_senders, not senders',
+    'must use senders, not spam_senders',
   );
 
   await expectInvalid(
@@ -107,18 +107,24 @@ try {
   );
 
   await expectInvalid(
-    'multiple_spam_senders',
+    'multiple_senders',
     config.replace(
-      'spam_senders = [{ rpc = "spam1", max_retries = 0 }]',
-      'spam_senders = [{ rpc = "spam1", max_retries = 0 }, { rpc = "spam2", max_retries = 0 }]',
+      'senders = [{ id = "spam1", max_retries = 0 }]',
+      'senders = [{ id = "spam1", max_retries = 0 }, { id = "spam2", max_retries = 0 }]',
     ),
-    'must use only rpc=spam1',
+    'must use only id=spam1',
   );
 
   await expectInvalid(
-    'tip_sender_section',
-    `${config}\n[[sender]]\nid = "other"\nurl = "https://example.invalid"\n`,
-    '[[sender]] must be absent',
+    'legacy_spam_rpc_section',
+    config.replace(/^\[\[sender\]\]$/m, '[[spam_rpc]]'),
+    '[[spam_rpc]] is not accepted',
+  );
+
+  await expectInvalid(
+    'duplicate_sender_section',
+    `${config}\n[[sender]]\nenabled = true\nid = "other"\nurl = "https://example.invalid"\n`,
+    'Expected exactly one [sender] section',
   );
 
   console.log(JSON.stringify({ status: 'last_live_config_test_passed' }));

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Normalize only the known mixed-schema LAST live profile to the configuration
-// documented in the official NotArb v1.1.2 distribution.  That release pairs
-// [[spam_rpc]] with [[swap.strategy]].spam_senders; [[sender]] / senders is a
-// different schema and must not be combined with the v1.1.2 spam RPC profile.
+// Normalize only the known legacy LAST live profile to the schema accepted by
+// the installed NotArb v1.1.2 onchain-bot.  Its sender constructor builds the
+// [[sender]] map and [[swap.strategy]].senders selects one entry from that map.
+// The old [[spam_rpc]] / spam_senders pair is not read by this onchain path.
 //
 // This utility deliberately does not print the TOML or its endpoint URL.  It
 // is invoked by the deployment job before the normal live-profile assertion.
@@ -24,17 +24,45 @@ const mode = (await stat(configPath)).mode & 0o777;
 const document = new TomlSections(original);
 const changes = [];
 
-if (document.count('sender') !== 0) {
-  fail('The v1.1.2 LAST live profile must not contain [[sender]].');
+const senderSections = document.named('sender');
+const spamRpcSections = document.named('spam_rpc');
+if (senderSections.length > 1 || spamRpcSections.length > 1) {
+  fail('The LAST live profile permits only one sender definition.');
 }
-const spamRpc = document.exactlyOne('spam_rpc');
-const spamId = spamRpc.stringValue('id');
-if (spamId !== 'spam1') {
-  fail('The v1.1.2 LAST live profile requires [[spam_rpc]] id = "spam1".');
+if (senderSections.length !== 0 && spamRpcSections.length !== 0) {
+  fail('The LAST live profile contains both [[sender]] and legacy [[spam_rpc]].');
 }
-const spamUrl = spamRpc.stringValue('url');
-if (!/^https:\/\/mainnet\.helius-rpc\.com\/\?api-key=.+$/i.test(spamUrl)) {
-  fail('The v1.1.2 LAST live profile requires a configured Helius [[spam_rpc]] URL.');
+
+let sender;
+if (spamRpcSections.length === 1) {
+  // Preserve the existing private endpoint verbatim while changing only the
+  // section name that the onchain-bot actually reads.
+  sender = spamRpcSections[0];
+  if (!sender.multi) fail('The legacy spam RPC must be declared as [[spam_rpc]].');
+  if (sender.value('enabled') !== 'true' || sender.stringValue('id') !== 'spam1') {
+    fail('The legacy spam RPC must be enabled with id = "spam1".');
+  }
+  sender.rename('sender');
+  changes.push('sender_schema');
+} else if (senderSections.length === 1) {
+  sender = senderSections[0];
+  if (!sender.multi) fail('The LAST live sender must be declared as [[sender]].');
+} else {
+  fail('The LAST live profile requires exactly one [[sender]].');
+}
+
+if (sender.value('enabled') !== 'true' || sender.stringValue('id') !== 'spam1') {
+  fail('The LAST live sender must be enabled with id = "spam1".');
+}
+const senderUrl = sender.stringValue('url');
+if (!/^https:\/\/mainnet\.helius-rpc\.com\/\?api-key=.+$/i.test(senderUrl)) {
+  fail('The LAST live profile requires a configured Helius [[sender]] URL.');
+}
+// max_idle_connections was a spam-RPC-only knob.  Dropping it avoids relying
+// on an unrecognized field if a predecessor happened to carry one.
+if (sender.has('max_idle_connections')) {
+  sender.removeValue('max_idle_connections');
+  changes.push('sender_max_idle_connections_removed');
 }
 
 const executor = document.exactlyOne('transaction_executor');
@@ -44,9 +72,9 @@ if (executor.value('threads') !== '0') {
 }
 
 const tokenChecker = document.exactlyOne('token_accounts_checker');
-if (tokenChecker.stringValue('rpc_url') !== spamUrl) {
-  tokenChecker.setValue('rpc_url', JSON.stringify(spamUrl));
-  changes.push('token_accounts_checker_spam_rpc');
+if (tokenChecker.stringValue('rpc_url') !== senderUrl) {
+  tokenChecker.setValue('rpc_url', JSON.stringify(senderUrl));
+  changes.push('token_accounts_checker_sender_rpc');
 }
 
 const blockhashUpdater = document.exactlyOne('blockhash_updater');
@@ -66,18 +94,18 @@ const strategy = document.exactlyOne('swap.strategy');
 if (strategy.has('senders') && strategy.has('spam_senders')) {
   fail('The strategy contains both senders and spam_senders.');
 }
-if (strategy.has('senders')) {
-  const normalized = normalizeSpamSenderArray(strategy.value('senders'));
-  strategy.renameValue('senders', 'spam_senders', normalized);
+if (strategy.has('spam_senders')) {
+  const normalized = normalizeSenderArray(strategy.value('spam_senders'));
+  strategy.renameValue('spam_senders', 'senders', normalized);
   changes.push('strategy_sender_schema');
-} else if (strategy.has('spam_senders')) {
-  const normalized = normalizeSpamSenderArray(strategy.value('spam_senders'));
-  if (normalized !== strategy.value('spam_senders')) {
-    strategy.setValue('spam_senders', normalized);
+} else if (strategy.has('senders')) {
+  const normalized = normalizeSenderArray(strategy.value('senders'));
+  if (normalized !== strategy.value('senders')) {
+    strategy.setValue('senders', normalized);
     changes.push('strategy_sender_fields');
   }
 } else {
-  fail('The v1.1.2 LAST live strategy is missing spam_senders.');
+  fail('The LAST live strategy is missing senders.');
 }
 
 const migrated = document.render();
@@ -94,38 +122,54 @@ console.log(JSON.stringify({
 }));
 }
 
-function normalizeSpamSenderArray(value) {
+function normalizeSenderArray(value) {
   const text = value.trim();
   if (!text.startsWith('[') || !text.endsWith(']')) {
     fail('Strategy sender configuration must be a TOML array.');
   }
   const bodies = [...text.matchAll(/\{([^{}]*)\}/g)];
   if (bodies.length !== 1 || text.replace(/\{[^{}]*\}/g, '').replace(/[\s,\[\]]/g, '') !== '') {
-    fail('The v1.1.2 LAST live profile requires exactly one spam sender object.');
+    fail('The LAST live profile requires exactly one sender object.');
   }
   const rawFields = bodies[0][1]
     .split(',')
     .map((field) => field.trim())
     .filter(Boolean);
-  const hadLegacyId = rawFields.some((field) => /^id\s*=/i.test(field));
-  const hadRequireProfit = rawFields.some((field) => /^require_profit\s*=/i.test(field));
-  const fields = rawFields
-    .filter((field) => !/^require_profit\s*=/i.test(field))
-    .map((field) => field.replace(/^id\s*=/i, 'rpc ='));
+  let changed = false;
+  const fields = [];
+  for (const rawField of rawFields) {
+    const match = rawField.match(/^([A-Za-z0-9_]+)\s*=\s*(.+)$/s);
+    if (!match) fail('Unsupported sender field syntax in the LAST live migration.');
+    let [, key, fieldValue] = match;
+    if (key === 'require_profit') {
+      changed = true;
+      continue;
+    }
+    if (key === 'rpc') {
+      key = 'id';
+      changed = true;
+    }
+    fields.push(`${key} = ${fieldValue.trim()}`);
+  }
   const values = new Map();
   for (const field of fields) {
     const match = field.match(/^([A-Za-z0-9_]+)\s*=\s*(.+)$/s);
-    if (!match) fail('Unsupported sender field syntax in the v1.1.2 migration.');
-    if (values.has(match[1])) fail(`Duplicate sender field in the v1.1.2 migration: ${match[1]}.`);
+    if (!match) fail('Unsupported sender field syntax in the LAST live migration.');
+    if (values.has(match[1])) fail(`Duplicate sender field in the LAST live migration: ${match[1]}.`);
     values.set(match[1], match[2].trim());
   }
-  if (values.get('rpc') !== '"spam1"' || values.get('max_retries') !== '0') {
-    fail('The v1.1.2 LAST live profile requires rpc = "spam1" and max_retries = 0.');
+  if (values.get('id') !== '"spam1"' || values.get('max_retries') !== '0') {
+    fail('The LAST live profile requires id = "spam1" and max_retries = 0.');
   }
-  for (const unsupported of ['id', 'require_profit', 'min_tip', 'max_tip']) {
-    if (values.has(unsupported)) fail(`Unsupported v1.1.2 spam sender field: ${unsupported}.`);
+  for (const unsupported of ['rpc', 'require_profit', 'min_tip', 'max_tip', 'min_jito_tip_lamports', 'max_jito_tip_lamports']) {
+    if (values.has(unsupported)) fail(`Unsupported LAST sender field: ${unsupported}.`);
   }
-  if (!hadLegacyId && !hadRequireProfit) return value;
+  for (const key of values.keys()) {
+    if (!['id', 'max_retries', 'preflight_commitment'].includes(key)) {
+      fail(`Unsupported LAST sender field: ${key}.`);
+    }
+  }
+  if (!changed) return value;
   return `[ { ${fields.join(', ')} } ]`;
 }
 
@@ -139,7 +183,7 @@ class TomlSections {
       if (!header) continue;
       if ((header[1] === '[[') !== (header[3] === ']]')) fail('Malformed TOML section header.');
       if (current) current.end = index;
-      current = new TomlSection(this, header[2], index, this.lines.length);
+      current = new TomlSection(this, header[2], header[1] === '[[', index, this.lines.length);
       this.sections.push(current);
     }
     if (current) current.end = this.lines.length;
@@ -147,6 +191,10 @@ class TomlSections {
 
   count(name) {
     return this.sections.filter((section) => section.name === name).length;
+  }
+
+  named(name) {
+    return this.sections.filter((section) => section.name === name);
   }
 
   exactlyOne(name) {
@@ -161,9 +209,10 @@ class TomlSections {
 }
 
 class TomlSection {
-  constructor(document, name, start, end) {
+  constructor(document, name, multi, start, end) {
     this.document = document;
     this.name = name;
+    this.multi = multi;
     this.start = start;
     this.end = end;
   }
@@ -209,6 +258,21 @@ class TomlSection {
     if (!assignment) fail(`[${this.name}] is missing ${oldKey}.`);
     const [, indent, , separator, , newline = ''] = assignment.match;
     this.document.lines[assignment.index] = `${indent}${newKey}${separator}${value}${newline}`;
+  }
+
+  removeValue(key) {
+    const assignment = this.assignment(key);
+    if (!assignment) return;
+    this.document.lines[assignment.index] = '';
+  }
+
+  rename(name) {
+    if (!this.multi) fail(`[[${this.name}]] must be an array-of-tables section.`);
+    const current = this.document.lines[this.start];
+    const updated = current.replace(/^(\s*\[\[)[A-Za-z0-9_.-]+(\]\])/, `$1${name}$2`);
+    if (updated === current) fail(`Could not rename [[${this.name}]].`);
+    this.document.lines[this.start] = updated;
+    this.name = name;
   }
 }
 

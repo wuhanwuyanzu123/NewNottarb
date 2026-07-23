@@ -11,13 +11,13 @@
 - NotArb `onchain-bot` loads only that target-specific `markets_file`; the global `[notarb_markets]` scan is disabled. The dry-run profile keeps all sender and executor paths off.
 - `last-notarb-supervisor.mjs` owns the lifecycle for both the dry-run and live profiles: it starts one child only after current LAST route activity is bridge-validated, and stops that child after 30 seconds of quiet activity or on any held/stale/mismatched local evidence. The observer records dedicated `lastRoute*` activity fields so unrelated LAST transactions cannot start the child.
 - The direct target-runner wrapper is supervisor-internal and receives the same explicitly passed TOML that the supervisor validates; it rejects a direct launch rather than leaving a quiet-period bot running.
-- `notarb-last-grpc-live.example.toml`, `assert-last-live.mjs`, and the live wrappers provide a local ignored ordinary-Helius-RPC sender profile with `transaction_executor.threads = 0` (NotArb v1.1.2's dynamic cached executor thread pool), an enabled SOL strategy, and `flash_loan = true`; the sender/swap execution path remains enabled.
+- `notarb-last-grpc-live.example.toml`, `assert-last-live.mjs`, and the live wrappers provide a local ignored ordinary-RPC sender profile with `transaction_executor.threads = 0` (NotArb's dynamic cached executor thread pool), one enabled `[[sender]]` selected through `[[swap.strategy]].senders`, an enabled SOL strategy, and `flash_loan = true`; the sender/swap execution path remains enabled.
 - Each Linux live child starts a detached, best-effort `getBalance` diagnostic which derives the fee-payer public key from the local configured keypair and uses only `[blockhash_updater].rpc_url`. A zero balance produces a structured warning without delaying or blocking NotArb.
 - `rust/last-route-bridge` is a compiled Linux route bridge. It owns the compact route lease, validates each outer NA instruction's ordered market-state group and ALTs through `LAST_READ_RPC_URL`, includes Orca Whirlpool's 653-byte market layout, and publishes `held/no_route_evidence` without an RPC call before the first qualified event.
 - When the validated market generation is unchanged but a new LAST route check has different ALT indexes or writable account metas, the Rust bridge refreshes the route-evidence fingerprint before publishing the renewed active lease. This keeps the observer, route record, and supervisor coherent without creating a duplicate generation.
 - The supervisor uses local status/markets file mtimes, not WSL payload timestamps, for a 20-second markets heartbeat and activity freshness; `held` and stale route status still end the child lease immediately.
 - A lifecycle activation key combines generation and LAST signature. The supervisor never relaunches a stopped/failed child for that same key after a transient publication gap; the next fresh validated signature is required for another child.
-- `npm run test:last:live-config` verifies the live ordinary-RPC contract offline: one `[[spam_rpc]]` plus `spam_senders`, a matching indexed Helius token-account checker, and four core reader roles fixed to `http://82.39.215.201:8899`. `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
+- `npm run test:last:live-config` verifies the live ordinary-RPC contract offline: one enabled `[[sender]]` plus `senders`, a matching indexed token-account checker, and four core reader roles fixed to `http://82.39.215.201:8899`. It rejects the old `[[spam_rpc]]` / `spam_senders` path, which did not resolve an enabled onchain-bot sender. `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
 - The deployment target is `root@82.23.138.51`: GitHub Actions builds the compiled Linux bridge and deploys immutable releases with the two systemd unit templates. Local Windows/WSL runners remain development-only.
 
 ## Current topology
@@ -39,7 +39,7 @@
   -> 82.23.138.51 NotArb blockhash, price, market, and ALT reads
 
 private live TOML Helius endpoint
-  -> 82.23.138.51 [[spam_rpc]] spam1 transaction sending and token-account checks
+  -> 82.23.138.51 enabled [[sender]] spam1 transaction sending and token-account checks
 ```
 
 The production pipeline unit pins `LAST_READ_RPC_URL` to
@@ -47,9 +47,9 @@ The production pipeline unit pins `LAST_READ_RPC_URL` to
 asserted to the same value. A standalone local wrapper uses that TOML section
 only when the environment value is absent, and neither form puts the endpoint
 in the Rust command line.
-The private Helius URL is absent from commands, logs, and tracked
-documentation; it is used only by the token-account checker and the ordinary
-`spam1` sender.
+The private sender URL is absent from commands, logs, and tracked
+documentation; it is used only by the token-account checker and the enabled
+ordinary-RPC `spam1` sender.
 
 The Linux deployment process path is:
 
@@ -83,9 +83,10 @@ systemd: notarb-last-live-supervisor.service
 ## Live profile inputs
 
 1. Set the ignored server `/etc/notarb-last/notarb-last-grpc-live.toml` to the bot keypair path. No wallet key is committed to this repository.
-2. Keep `[blockhash_updater].rpc_url`, `[price_updater].rpc_url`, `[market_loader].rpc_url`, and `[lookup_table_loader].rpc_url` fixed to `http://82.39.215.201:8899`. Set `[token_accounts_checker].rpc_url` and `[[spam_rpc]].url` to the same private indexed Helius endpoint. The 82 reader lacks the bot wallet's required token-account secondary index, so it is not used for the token-account checker or sender.
-3. The tracked NotArb v1.1.2 ordinary-RPC profile uses one Helius `[[spam_rpc]]` sender and `spam_senders = [{ rpc = "spam1", ... }]` (not `[[sender]]` / `senders`), omits `require_profit`, caps priority fee at 25,000 lamports, uses no Jito tip, and has a 1,000 ms cooldown. Adjust the ignored local copy if different runtime limits are desired.
-4. Durable nonces remain optional. When used, place only nonce accounts controlled by the configured bot wallet in a `[[nonce_pool]]`.
+2. Keep `[blockhash_updater].rpc_url`, `[price_updater].rpc_url`, `[market_loader].rpc_url`, and `[lookup_table_loader].rpc_url` fixed to `http://82.39.215.201:8899`. Set `[token_accounts_checker].rpc_url` and the `url` in `[[sender]]` to the same private indexed endpoint. The 82 reader lacks the bot wallet's required token-account secondary index, so it is not used for the token-account checker or sender.
+3. The tracked onchain-bot ordinary-RPC profile uses exactly one enabled `[[sender]]` with `id = "spam1"` and `[[swap.strategy]].senders = [{ id = "spam1", max_retries = 0 }]`. It omits `require_profit`, caps priority fee at 25,000 lamports, uses no Jito tip, and has a 1,000 ms cooldown. `[[spam_rpc]]` and `spam_senders` are a different path and must be absent from this profile.
+4. Migration check: the deployment's `migrate-last-live-config.mjs` preserves the private endpoint while replacing `[[spam_rpc]]` with `[[sender]]`, renaming `spam_senders` to `senders`, and changing the inner selector from `rpc` to `id`. Run it, then run `assert-last-live.mjs`, against the private TOML before restarting the service. If the child log says `There are no enabled [[sender]] configs with id: spam1`, the selected strategy still has no matching enabled `[[sender]]`.
+5. Durable nonces remain optional. When used, place only nonce accounts controlled by the configured bot wallet in a `[[nonce_pool]]`.
 
 ## Safe validation command
 
@@ -102,4 +103,7 @@ For the deployed live profile, copy `notarb-last-grpc-live.example.toml` to the
 ignored server config, run `assert-last-live.mjs` without placing the reader
 endpoint on the command line (it derives the shared value from
 `[blockhash_updater]`), and enable the server supervisor after stopping any
-prior live runtime.
+prior live runtime. During a fresh active lease, inspect a new interval of
+`notarb-last-target-live.stdout.log` and `.stderr.log`: a loaded market group
+proves route wiring only; an explicit returned transaction signature is the
+runtime proof of a submitted transaction.

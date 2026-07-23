@@ -2,7 +2,7 @@
 # This configuration is target-only: the LAST bridge supplies its exact markets
 # and ALTs; the global scanner stays off. The default sender is one ordinary
 # Solana JSON-RPC endpoint. Blockhash, price, market, and ALT reads use the
-# recovered 82 reader directly. The token-account index and [[spam_rpc]] stay
+# recovered 82 reader directly. The token-account index and [[sender]] stay
 # on the private Helius URL because 82 explicitly excludes this bot from its
 # token-account secondary index.
 
@@ -55,12 +55,11 @@ enabled = false
 dry_run = false
 grpc_url = "http://127.0.0.1:18100"
 
-[[spam_rpc]]
+[[sender]]
 enabled = true
 id = "spam1"
 # The only Helius endpoint: ordinary transaction sending.
 url = "https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY"
-max_idle_connections = 1
 
 [[swap]]
 enabled = true
@@ -77,7 +76,7 @@ cu_limit = 369100
 min_priority_fee_lamports = 1000
 max_priority_fee_lamports = 25000
 cooldown_ms = 1000
-# NotArb maps this to the [[spam_rpc]] id above. `senders` is for [[sender]]
-# profiles and leaves an ordinary spam RPC unresolved.
-# v1.1.2 defaults require_profit to true, so leave that optional field out.
-spam_senders = [{ rpc = "spam1", max_retries = 0 }]
+# The onchain-bot sender map resolves this [[sender]] id. Leave
+# require_profit out: it is optional and the strategy's regular evaluator
+# still decides whether an opportunity reaches the sender.
+senders = [{ id = "spam1", max_retries = 0 }]
