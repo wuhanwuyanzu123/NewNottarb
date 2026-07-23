@@ -15,16 +15,19 @@ const root = resolve(process.cwd());
 const migration = join(root, 'migrate-last-live-config.mjs');
 const assertion = join(root, 'assert-last-live.mjs');
 const templatePath = join(root, 'notarb-last-grpc-live.example.toml');
-const readRpcUrl = 'http://82.39.215.201:8899';
 const heliusUrl = 'https://mainnet.helius-rpc.com/?api-key=fixture-indexed-key';
+const readerUrl = 'http://82.39.215.201:8899';
 const directory = await mkdtemp(join(tmpdir(), 'last-live-migration-'));
 const configPath = join(directory, 'notarb-last-grpc-live.toml');
+const { LAST_READ_RPC_URL: _ignoredReadRpcUrl, ...environmentWithoutReadRpc } = process.env;
 
 async function run(command, args) {
   try {
     const result = await execFileAsync(command, args, {
       cwd: directory,
-      env: { ...process.env, LAST_READ_RPC_URL: readRpcUrl },
+      // The assertion derives the shared reader from the private config when
+      // this variable is intentionally absent.
+      env: environmentWithoutReadRpc,
     });
     return { code: 0, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   } catch (error) {
@@ -40,10 +43,14 @@ try {
   const template = await readFile(templatePath, 'utf8');
   const configured = template
     .replace('REPLACE_WITH_DEDICATED_FUNDED_KEYPAIR.json', 'fixture-keypair.json')
-    .replaceAll('http://127.0.0.1:18899', readRpcUrl)
     .replaceAll('https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY', heliusUrl);
+  // Model the deployed predecessor: direct reader URLs plus the old sender
+  // schema. Migration must keep the sender/token index direct but move the
+  // four core read roles to the recovered 82 reader.
   const hybrid = configured
+    .replaceAll(readerUrl, heliusUrl)
     .replace('threads = 0', 'threads = 1')
+    .replace('delay_ms = 1000', 'delay_ms = 250')
     .replace(
       'spam_senders = [{ rpc = "spam1", max_retries = 0 }]',
       'senders = [{ id = "spam1", max_retries = 0, require_profit = true }]',
@@ -56,9 +63,13 @@ try {
   if (migrated.code !== 0 || !migrated.stdout.includes('last_live_config_migrated_v1_1_2')) {
     throw new Error(`hybrid_profile_not_migrated:${migrated.stderr || migrated.stdout}`);
   }
+  if (!migrated.stdout.includes('blockhash_updater_delay_ms')) {
+    throw new Error(`blockhash_delay_not_migrated:${migrated.stderr || migrated.stdout}`);
+  }
   const migratedText = await readFile(configPath, 'utf8');
   for (const expected of [
     'threads = 0',
+    'delay_ms = 1000',
     'spam_senders = [ { rpc = "spam1", max_retries = 0 } ]',
   ]) {
     if (!migratedText.includes(expected)) throw new Error(`missing_expected_migration:${expected}`);
@@ -78,6 +89,10 @@ try {
     : tokenRest.slice(0, tokenEnd < 0 ? tokenRest.length : tokenEnd).join('\n');
   if (!tokenChecker.includes(`rpc_url = "${heliusUrl}"`)) {
     throw new Error('token_checker_not_migrated_to_spam_rpc');
+  }
+  for (const section of ['blockhash_updater', 'price_updater', 'market_loader', 'lookup_table_loader']) {
+    const expression = new RegExp(`\\[${section.replace('.', '\\.') }\\][\\s\\S]*?rpc_url\\s*=\\s*"${readerUrl.replace(/[./]/g, '\\$&')}"`);
+    if (!expression.test(migratedText)) throw new Error(`reader_not_migrated_to_last_reader:${section}`);
   }
 
   const asserted = await run(process.execPath, [assertion, configPath]);

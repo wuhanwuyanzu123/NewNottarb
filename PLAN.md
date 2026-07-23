@@ -5,7 +5,7 @@
 - A standalone Yellowstone gRPC observer tracks `LASTvjDWkbXM1RwUCiniHqGLSEH5xJinDRs56wNPQr9` through the 82 endpoint.
 - The observer keeps no-profit NotArb checks as arbitrage-intent evidence: mint, intended DEX programs, ALT tables, and a distinct `not_executed` price status.
 - The observed public ALT IDs are stored in `last-grpc-active-lookup-tables.txt`.
-- `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file` and route-specific ALT file; it derives market-state addresses from the outer NA instruction's DEX-program offsets, verifies expected owner/layout, and excludes unreadable ALT accounts through the 82 read-RPC tunnel before using an address.
+- `last-route-to-notarb.mjs` converts LAST gRPC evidence into an exact NotArb `markets_file` and route-specific ALT file; it derives market-state addresses from the outer NA instruction's DEX-program offsets, verifies expected owner/layout, and excludes unreadable ALT accounts through the configured read RPC before using an address. The 82 read-RPC tunnel remains a legacy local-development option only.
 - The observer normalizes route fingerprints to suppress account-order noise while retaining writable route accounts, and the bridge switches generations only when the validated mint/DEX/pool/ALT set actually changes.
 - The active target is intentionally dynamic. Read `last-target-route.json` together with `last-target-status.json` rather than hard-coding a historical mint or pool group.
 - NotArb `onchain-bot` loads only that target-specific `markets_file`; the global `[notarb_markets]` scan is disabled. The dry-run profile keeps all sender and executor paths off.
@@ -16,7 +16,7 @@
 - When the validated market generation is unchanged but a new LAST route check has different ALT indexes or writable account metas, the Rust bridge refreshes the route-evidence fingerprint before publishing the renewed active lease. This keeps the observer, route record, and supervisor coherent without creating a duplicate generation.
 - The supervisor uses local status/markets file mtimes, not WSL payload timestamps, for a 20-second markets heartbeat and activity freshness; `held` and stale route status still end the child lease immediately.
 - A lifecycle activation key combines generation and LAST signature. The supervisor never relaunches a stopped/failed child for that same key after a transient publication gap; the next fresh validated signature is required for another child.
-- `npm run test:last:live-config` verifies the live ordinary-RPC contract offline: one `[[spam_rpc]]` plus `spam_senders`, a matching indexed Helius token-account checker, and the four direct 82 reader RPC roles. `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
+- `npm run test:last:live-config` verifies the live ordinary-RPC contract offline: one `[[spam_rpc]]` plus `spam_senders`, a matching indexed Helius token-account checker, and four core reader roles fixed to `http://82.39.215.201:8899`. `npm run test:last:supervisor` verifies the lifecycle entirely offline with a fake child: start once, tolerate continuous activity without duplication, survive the bridge generation publication window, stop on quiet, and restart on the next activity. `npm run test:last:bridge` verifies that a partial JSONL tail and a mint-only/no-DEX event never become a route.
 - The deployment target is `root@82.23.138.51`: GitHub Actions builds the compiled Linux bridge and deploys immutable releases with the two systemd unit templates. Local Windows/WSL runners remain development-only.
 
 ## Current topology
@@ -33,12 +33,20 @@
   -> target-only NotArb child while lease is active
   -> NotArb [[markets_file]] / [[lookup_tables_file]]
 
-82.39.215.201:8899 Solana JSON-RPC (account/blockhash/ALT reads)
-  -> 82.23.138.51 Rust validation and NotArb blockhash, price, market, and ALT reads
+82.39.215.201:8899 Solana JSON-RPC (core read RPC)
+  -> inherited `LAST_READ_RPC_URL` for Rust validation
+  -> 82.23.138.51 NotArb blockhash, price, market, and ALT reads
 
-Helius ordinary JSON-RPC
+private live TOML Helius endpoint
   -> 82.23.138.51 [[spam_rpc]] spam1 transaction sending and token-account checks
 ```
+
+The production wrapper derives `LAST_READ_RPC_URL` from the private
+`[blockhash_updater]` section, whose asserted value is
+`http://82.39.215.201:8899`, rather than putting it in the Rust command line.
+The private Helius URL is absent from commands, logs, and tracked
+documentation; it is used only by the token-account checker and the ordinary
+`spam1` sender.
 
 The Linux deployment process path is:
 
@@ -72,7 +80,7 @@ systemd: notarb-last-live-supervisor.service
 ## Live profile inputs
 
 1. Set the ignored server `/etc/notarb-last/notarb-last-grpc-live.toml` to the bot keypair path. No wallet key is committed to this repository.
-2. Set `[token_accounts_checker].rpc_url` to exactly match the indexed Helius `[[spam_rpc]].url`. The 82 node does not expose the bot wallet through token-account secondary indexes; blockhash, price, market, and ALT reads stay on 82.
+2. Keep `[blockhash_updater].rpc_url`, `[price_updater].rpc_url`, `[market_loader].rpc_url`, and `[lookup_table_loader].rpc_url` fixed to `http://82.39.215.201:8899`. Set `[token_accounts_checker].rpc_url` and `[[spam_rpc]].url` to the same private indexed Helius endpoint. The 82 reader lacks the bot wallet's required token-account secondary index, so it is not used for the token-account checker or sender.
 3. The tracked NotArb v1.1.2 ordinary-RPC profile uses one Helius `[[spam_rpc]]` sender and `spam_senders = [{ rpc = "spam1", ... }]` (not `[[sender]]` / `senders`), omits `require_profit`, caps priority fee at 25,000 lamports, uses no Jito tip, and has a 1,000 ms cooldown. Adjust the ignored local copy if different runtime limits are desired.
 4. Durable nonces remain optional. When used, place only nonce accounts controlled by the configured bot wallet in a `[[nonce_pool]]`.
 
@@ -88,6 +96,7 @@ npm run supervise:last:dryrun
 ```
 
 For the deployed live profile, copy `notarb-last-grpc-live.example.toml` to the
-ignored server config, run `assert-last-live.mjs` with
-`LAST_READ_RPC_URL=http://82.39.215.201:8899`, and enable the server supervisor
-after stopping any prior live runtime.
+ignored server config, run `assert-last-live.mjs` without placing the reader
+endpoint on the command line (it derives the shared value from
+`[blockhash_updater]`), and enable the server supervisor after stopping any
+prior live runtime.

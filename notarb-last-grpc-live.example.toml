@@ -1,10 +1,10 @@
 # Copy to notarb-last-grpc-live.toml and set the dedicated funded bot keypair.
 # This configuration is target-only: the LAST bridge supplies its exact markets
 # and ALTs; the global scanner stays off. The default sender is one ordinary
-# Solana JSON-RPC endpoint. Configure the reader/load RPCs below consistently
-# with the deployment's LAST_READ_RPC_URL. The token-account checker is the
-# exception: it uses the same indexed Helius endpoint as the ordinary sender
-# so it can enumerate the bot wallet.
+# Solana JSON-RPC endpoint. Blockhash, price, market, and ALT reads use the
+# recovered 82 reader directly. The token-account index and [[spam_rpc]] stay
+# on the private Helius URL because 82 explicitly excludes this bot from its
+# token-account secondary index.
 
 [notarb]
 acknowledge_terms_of_service = true
@@ -14,24 +14,23 @@ keypair_path = "REPLACE_WITH_DEDICATED_FUNDED_KEYPAIR.json"
 protect_keypair = false
 
 [blockhash_updater]
-rpc_url = "http://127.0.0.1:18899"
-delay_ms = 250
+rpc_url = "http://82.39.215.201:8899"
+delay_ms = 1000
 
 [price_updater]
-rpc_url = "http://127.0.0.1:18899"
+rpc_url = "http://82.39.215.201:8899"
 
 [token_accounts_checker]
-# Keep this on an indexed Helius endpoint, not the 82.39 read RPC. The 82.39
-# node excludes this wallet from token-account secondary indexes.
-# It must exactly match the [[spam_rpc]] spam1 URL below.
+# The 82 reader answers market/ALT/blockhash queries but returns
+# `excluded from account secondary indexes` for this bot's token owner query.
 rpc_url = "https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY"
 delay_seconds = 3
 
 [market_loader]
-rpc_url = "http://127.0.0.1:18899"
+rpc_url = "http://82.39.215.201:8899"
 
 [lookup_table_loader]
-rpc_url = "http://127.0.0.1:18899"
+rpc_url = "http://82.39.215.201:8899"
 
 [transaction_executor]
 # NotArb v1.1.2: 0 selects the dynamic cached executor thread pool; it does
@@ -59,7 +58,9 @@ grpc_url = "http://127.0.0.1:18100"
 [[spam_rpc]]
 enabled = true
 id = "spam1"
+# The only Helius endpoint: ordinary transaction sending.
 url = "https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY"
+max_idle_connections = 1
 
 [[swap]]
 enabled = true

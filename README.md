@@ -28,13 +28,24 @@ services without a local SSH forward:
   -> target route / markets / ALT / status files
   -> activity-gated NotArb supervisor
 
-82.39.215.201:8899 read RPC
-  -> Rust market-state/ALT validation and NotArb blockhash, price, market, and ALT reads
+82.39.215.201:8899 Solana JSON-RPC (core read RPC)
+  -> inherited `LAST_READ_RPC_URL` for Rust market-state/ALT validation
+  -> 82.23.138.51 NotArb blockhash, price, market, and ALT reader roles
 
-Helius ordinary JSON-RPC
-  -> live `spam1` `[[spam_rpc]]` transaction sending and
-     token_accounts_checker account-index reads
+Private live TOML Helius endpoint
+  -> `token_accounts_checker` account-index reads and live `spam1`
+     `[[spam_rpc]]` transaction sending
 ```
+
+The four core NotArb reader roles are `[blockhash_updater]`,
+`[price_updater]`, `[market_loader]`, and `[lookup_table_loader]`. Production
+requires all four to use `http://82.39.215.201:8899`; the bridge inherits that
+same value as `LAST_READ_RPC_URL`. `[token_accounts_checker]` and
+`[[spam_rpc]] spam1` instead share the private indexed Helius endpoint because
+the 82 reader excludes this bot from token-account secondary indexes. The
+literal Helius endpoint stays only in the mode-`0600` live TOML: do not put it
+in command lines, process arguments, logs, examples, or committed
+documentation.
 
 The deployment templates create `notarb-last-pipeline.service` and
 `notarb-last-live-supervisor.service`. After an explicit deployment, check
@@ -45,7 +56,8 @@ ssh root@82.23.138.51 "systemctl --no-pager status notarb-last-pipeline.service 
 ```
 
 The two local ports `127.0.0.1:18100` and `127.0.0.1:18899` are not part of
-the deployed runtime. They remain an optional local-development topology only.
+the deployed runtime. They remain an optional legacy local-development
+topology only; the latter does not select the production reader.
 
 The live TOML is private under `/etc/notarb-last`, whereas the bridge writes
 the rotating markets and ALT files beneath the CI-managed
@@ -214,7 +226,11 @@ The production route bridge is Linux-compatible and runs in the 82.23 pipeline.
 It reads the local gRPC JSONL evidence, uses `LAST_READ_RPC_URL` for account
 and ALT validation, writes the target route lease, and supports Orca Whirlpool
 market states (`653` bytes) in addition to the existing Pump, Meteora, and
-Raydium layouts. The deployed value is `http://82.39.215.201:8899`.
+Raydium layouts. When no explicit local-development override is supplied,
+`run-last-rust-pipeline.sh` derives the asserted
+`http://82.39.215.201:8899` value from the private live TOML's
+`[blockhash_updater].rpc_url` and exports it to the bridge. It never supplies
+the reader endpoint as a bridge command-line argument or writes it to a log.
 
 For local WSL development, run the Linux pipeline only after stopping any
 legacy Windows observer and bridge:
@@ -270,19 +286,19 @@ Its bundled `onchain-bot/example.toml` pairs `[[spam_rpc]]` with
 ```toml
 [[spam_rpc]]
 id = "spam1"
-url = "https://mainnet.helius-rpc.com/?api-key=…"
+# Its endpoint is stored only in the private live TOML.
 
 [[swap.strategy]]
 spam_senders = [{ rpc = "spam1", max_retries = 0 }]
 ```
 
 Do not cross this with the distinct `[[sender]]` / `senders` schema. The
-deployment validates the v1.1.2 pair, omits `require_profit`, and preserves
-the ordinary 82 read RPC for blockhash, price, market, and ALT reads.
+deployment validates the v1.1.2 pair, omits `require_profit`, and requires the
+four core reader/load sections to use `http://82.39.215.201:8899`.
 
 ```powershell
 Copy-Item .\notarb-last-grpc-live.example.toml .\notarb-last-grpc-live.toml
-notepad .\notarb-last-grpc-live.toml # set the local bot keypair and Helius sending URL
+notepad .\notarb-last-grpc-live.toml # set the local bot keypair and private Helius value
 node .\assert-last-live.mjs .\notarb-last-grpc-live.toml
 npm run supervise:last:live
 ```
@@ -297,11 +313,10 @@ local development only.
 For NotArb v1.1.2, the ordinary-RPC sender is `[[spam_rpc]] spam1`; do not
 substitute `[[sender]]` / `senders` for this profile.
 `[[swap.strategy]].spam_senders` maps to it with `rpc = "spam1"`, keeps
-`max_retries = 0`, omits `require_profit`, and has no Jito tip. Per the
-82.39 does not index this bot wallet for `getTokenAccountsByOwner`, so
-`token_accounts_checker.rpc_url` must match `[[spam_rpc]].url` on Helius;
-blockhash, price, market, and ALT loaders remain on 82.39. Priority fees remain
-capped at 25,000 lamports and the cooldown is
+`max_retries = 0`, omits `require_profit`, and has no Jito tip. The private
+Helius endpoint backs only `token_accounts_checker` and `[[spam_rpc]]`; all
+four core reader/load sections remain on `http://82.39.215.201:8899`. Priority
+fees remain capped at 25,000 lamports and the cooldown is
 1,000 ms.
 
 ## Runtime evidence

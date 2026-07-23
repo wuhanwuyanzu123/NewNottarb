@@ -4,13 +4,41 @@ This guide is enough to reproduce the current dry-run and activity-gated live
 profiles from a clean clone. It deliberately does not include a wallet or SSH
 private key.
 
-## 2026-07-22 current handoff: NA instruction-scoped market pairs
+## 2026-07-23 current handoff: NA instruction-scoped market pairs and reader RPC
 
-**Code baseline before this document:** `136ea35 Restrict LAST pools to NA
-instruction accounts`, pushed to
-`origin/codex/last-activity-lifecycle`. This section records the exact resume
-point; the remainder of this file contains the clone, deployment, and runtime
-procedures.
+**Server baseline observed while updating this document:** `6390f47 Emit NA
+instruction market pairs for NotArb`, deployed at
+`/opt/notarb-last/releases/6390f470e79b1c371b9b3ca2dcb13243f471b83c` on
+`82.23.138.51`. The reader-RPC, retry, and Raydium CLMM changes documented
+below need their own successful CI deployment before that server pointer is
+expected to change. The remainder of this file contains the clone, deployment,
+and runtime procedures.
+
+### Reader-RPC operational update
+
+The Yellowstone observer remains directly connected to
+`82.39.215.201:10000`. The current core JSON-RPC reader is directly
+`http://82.39.215.201:8899`; it supplies the Rust bridge and NotArb blockhash,
+price, market, and ALT reads.
+
+The current production reader/sender contract is:
+
+1. `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
+   `[lookup_table_loader]` in the ignored
+   `/etc/notarb-last/notarb-last-grpc-live.toml` must all be
+   `http://82.39.215.201:8899`. `assert-last-live.mjs` rejects a mismatch.
+2. `run-last-rust-pipeline.sh` derives `LAST_READ_RPC_URL` from the asserted
+   blockhash section when no local-development override is supplied and passes
+   it only as inherited process environment to the Rust bridge. The endpoint is
+   not a bridge CLI argument.
+3. `[token_accounts_checker]` and `[[spam_rpc]] spam1` share the private
+   indexed Helius endpoint for token-account index reads and ordinary-RPC
+   sending. The 82 reader excludes this bot from its token-account secondary
+   index.
+
+Do not print, commit, put into a shell command, include in process arguments,
+or copy the private Helius endpoint into logs or documentation. The tracked
+example contains placeholders only; the private live TOML remains mode `0600`.
 
 ### What changed and why
 
@@ -32,7 +60,8 @@ accounts from another leg, and addresses loaded from an ALT. The reliable
 route-local boundary is the account-meta vector of the outer
 `NA247a7YE9S3p9CdKmMyETx8TTwbSdVbVYHHxpnHTUV` instruction.
 
-`136ea35` therefore makes these two coordinated changes:
+The instruction-scoped market-pair implementation makes these two coordinated
+changes:
 
 1. `grpc-last.mjs` records every top-level NotArb instruction in
    `notArb.instructions[]`, with each expanded account's instruction-relative
@@ -42,10 +71,13 @@ route-local boundary is the account-meta vector of the outer
    DEX program and takes only its market-state account at the verified
    instruction-relative offset: `+1` for Raydium AMM v4, Pump AMM, Meteora
    DLMM, and Orca Whirlpool; `+2` for Meteora CPMM (the skipped `+1` account
-   is its event authority). It confirms the expected DEX owner and binary
-   layout through the read RPC. Every validated outer NA instruction becomes
-   one NotArb `groups[]` entry in its original market order; it is not reduced
-   to a target-mint or WSOL-only subset. The route record writes
+   is its event authority) and Raydium CLMM (the skipped `+1` account is
+   AmmConfig). Raydium CLMM additionally requires the 1,544-byte PoolState
+   discriminator, so configuration accounts never become market inputs. The
+   bridge confirms the expected DEX owner and binary layout through the read
+   RPC. Every validated outer NA instruction becomes one NotArb `groups[]`
+   entry in its original market order; it is not reduced to a target-mint or
+   WSOL-only subset. The route record writes
    `marketCandidateSource: "na_instruction_market_pairs"`,
    `validatedMarketStates[]`, and a `naInstructionReferences` array with the
    DEX-program and market positions. The older `pool*` fields remain aliases
@@ -82,24 +114,28 @@ accepting a new broad candidate set.
   `AakC3joD4NEYmwXc6by5xmtVcxbZBrBJW4FCWxZBoGj7` (DLMM, 904 bytes),
   `EDX18gJCdijqSLAJA2pp5C2VmA3bTRrx4utxkeJuFRtQ` (Pump, 301 bytes), and
   `Gov3BLH9edvuSrSLj4a74ExM7KBrYQ2Z2eAsYff2bLuE` (CPMM, 1112 bytes).
-- The current change passes `node --check grpc-last.mjs`, `git diff --check`,
-  Rust `cargo fmt --check`, and the locked Rust test suite in CI.
+- The current source change passes the offline Node configuration, lifecycle,
+  and bridge tests plus `git diff --check`. GitHub Actions uses stable Rust to
+  run the locked Rust test suite and build the Linux bridge; the server's old
+  Cargo 1.75 is intentionally not used for the release build.
 
 ### Runtime status at handoff
 
 There is no recorded real `sendTransaction` signature at this handoff point.
-The most recent retained LAST route had exceeded its activity lease, so the
-bridge status was `held` with `observer_stale`; an absent NotArb child in that
-state is expected. A `No arbitrage profit found` log is still useful route
-intent evidence, but it is not an executed fill or a realized price.
+A fresh `active` lease is expected to create the Java child; `held`, quiet, or
+stale evidence is expected to leave that child absent. A `No arbitrage profit
+found` log is still useful route-intent evidence, but it is not an executed
+fill or a realized price. If a core-reader validation fails, the bridge first
+publishes `held(reader_retry)` to stop any prior child, then retries that same
+route with a bounded 1--30 second backoff; a fresh LAST route bypasses the
+backoff immediately.
 
-The deployed baseline before `136ea35` was `ecaf38a` at
-`/opt/notarb-last/releases/ecaf38ab8aeccc0d08f193afd84a36964f8010d6` on
-`82.23.138.51`. The new commit is pushed but must be treated as deployed only
-after its GitHub Actions run succeeds and `/opt/notarb-last/current` resolves
-to its release. The runtime itself is on `82.23.138.51`; it directly reads
-Yellowstone from `82.39.215.201:10000` and the read RPC from
-`82.39.215.201:8899`.
+The runtime reads Yellowstone from `82.39.215.201:10000` and uses
+`http://82.39.215.201:8899` for bridge and core NotArb reads. Its private
+Helius endpoint remains limited to token-account checking and the `spam1`
+ordinary-RPC sender. Treat a source commit as deployed only after its GitHub
+Actions run succeeds and `/opt/notarb-last/current` resolves to the matching
+release directory.
 
 ### Resume checklist after a fresh LAST event
 
@@ -146,12 +182,13 @@ Yellowstone from `82.39.215.201:10000` and the read RPC from
    one. A running Java process, `[markets_file] Groups: 1`, or an active route
    alone does not establish that a transaction was sent.
 
-5. If the old token-account `-32010` error returns, verify that only
-   `[token_accounts_checker]` and `[[spam_rpc]]` use the indexed Helius URL;
-   leave blockhash, price, market, and ALT readers on the 82 read RPC. The
-   live profile uses `[[spam_rpc]]` plus `spam_senders`, omits
-   `require_profit`, has no Jito tip, and uses `threads = 0` as NotArb's
-   dynamic executor setting.
+5. If a core blockhash, market, ALT, or price-reader error returns, verify that
+   `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
+   `[lookup_table_loader]` exactly match `http://82.39.215.201:8899`. If a
+   token-account error returns, confirm that `[token_accounts_checker]` and
+   `[[spam_rpc]]` use the same private indexed Helius endpoint. The live
+   profile uses `[[spam_rpc]]` plus `spam_senders`, omits `require_profit`, has
+   no Jito tip, and uses `threads = 0` as NotArb's dynamic executor setting.
 
 ## 82.23.138.51 deployment target
 
@@ -184,10 +221,12 @@ absent. The current server paths are:
 /var/lib/notarb-last/runtime-state  generated observer/bridge/supervisor state
 ```
 
-When deployed, the server connects directly to `82.39.215.201:10000` (gRPC) and
-`82.39.215.201:8899` (read RPC). The blockhash, price, market, and ALT loaders
-stay on that read RPC. The token-account checker matches the indexed Helius
-`[[spam_rpc]]` URL because the 82 read node does not index this bot wallet.
+When deployed, the server connects directly to `82.39.215.201:10000` for
+Yellowstone gRPC and to `http://82.39.215.201:8899` for core reads. The
+blockhash, price, market, and ALT loader sections must all use the 8899 reader,
+and the Rust bridge derives that same value without placing it in its command
+line. The token-account checker matches the private indexed Helius
+`[[spam_rpc]]` endpoint because the 82 reader does not index this bot wallet.
 For NotArb v1.1.2, `spam1` is
 selected through `[[spam_rpc]]` plus
 `spam_senders = [{ rpc = "spam1", ... }]`; it is the single ordinary Helius
@@ -202,12 +241,14 @@ Windows/WSL observer processes or local SSH tunnels in this deployment.
 2. Create `/etc/notarb-last` with mode `0700`, then create
    `/etc/notarb-last/keypair.json` and
    `/etc/notarb-last/notarb-last-grpc-live.toml` as `root:root`, mode `0600`.
-   Start the live TOML from the tracked example, set the bot keypair and
-   Helius API key, set `blockhash_updater`, `price_updater`, `market_loader`,
-    `lookup_table_loader`, and `grpc_url` to the direct 82.39 endpoints; set
+    Start the live TOML from the tracked example, set the bot keypair, and keep
+    `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
+    `[lookup_table_loader]` at `http://82.39.215.201:8899`. Set
     `[token_accounts_checker].rpc_url` and `[[spam_rpc]].url` to the same
-    indexed Helius endpoint. Keep the markets and ALT paths relative; the live service
-    maintains their stable `/etc/notarb-last` links. Do not commit this file or
+    private indexed Helius endpoint. Keep `[notarb_markets]` disabled and the
+    markets and ALT paths relative; the separate systemd observer remains on
+    Yellowstone gRPC `82.39.215.201:10000`. The live service maintains stable
+    `/etc/notarb-last` links. Do not commit this file, its private endpoint, or
     the keypair.
 3. For the first deployment only, place the matching NotArb JAR at
    `/opt/notarb-last/.notarb-1.1.2.jar`. The workflow verifies it and installs
@@ -224,13 +265,12 @@ Windows/WSL observer processes or local SSH tunnels in this deployment.
    path filters, or invoke **Build and deploy LAST runtime** manually from the
    Actions tab. The `production` job uploads, activates, and checks the
    release.
-6. Verify the config without printing its secret URL, then inspect the two
-   service states and logs:
+6. Verify the config without printing its private endpoint or putting it on a
+   command line, then inspect the two service states and logs:
 
    ```bash
-   LAST_READ_RPC_URL=http://82.39.215.201:8899 \
-     /usr/bin/node /opt/notarb-last/current/assert-last-live.mjs \
-       /etc/notarb-last/notarb-last-grpc-live.toml
+   /usr/bin/node /opt/notarb-last/current/assert-last-live.mjs \
+     /etc/notarb-last/notarb-last-grpc-live.toml
    systemctl --no-pager --full status notarb-last-pipeline.service notarb-last-live-supervisor.service
    tail -n 50 /opt/notarb-last/current/last-route-rust.stderr.log
    tail -n 50 /opt/notarb-last/current/last-notarb-live-supervisor.stdout.log
@@ -278,7 +318,8 @@ the key path if yours differs.
 # Yellowstone gRPC: LAST observer
 ssh -i "$env:USERPROFILE\.ssh\id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -N -L 127.0.0.1:18100:82.39.215.201:10000 root@82.23.138.51
 
-# Standard Solana JSON-RPC: read-only blockhash, market account, and ALT reads
+# Legacy local-development JSON-RPC only: read-only blockhash, market account,
+# and ALT reads. Do not use this tunnel as the production reader.
 ssh -i "$env:USERPROFILE\.ssh\id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -N -L 127.0.0.1:18899:82.39.215.201:8899 root@82.23.138.51
 ```
 
@@ -302,7 +343,7 @@ writes the canonical observer logs used by the monitor.
 
 ## Start the WSL observer and compiled Rust bridge
 
-For the Linux runtime, keep the two SSH forwards running, stop any Windows
+For the local WSL runtime, keep the two SSH forwards running, stop any Windows
 `grpc-last.mjs` and `last-route-to-notarb.mjs` instances, then run:
 
 ```powershell
@@ -313,7 +354,7 @@ The script starts the WSL Node Yellowstone reader in append-only `--no-state`
 mode and compiles/runs `rust/last-route-bridge` from the WSL cargo cache. The
 Rust process writes the lifecycle state and target markets, supports Orca
 Whirlpool (`whirLb...`, 653-byte pool state), and uses the same local
-`127.0.0.1:18899` read-RPC tunnel. Its logs are
+`127.0.0.1:18899` legacy development read-RPC tunnel. Its logs are
 `last-grpc-rust-runtime.*.log` and `last-route-rust.*.log`.
 
 The observer records NotArb's no-profit checks as route-intent evidence. A
@@ -348,7 +389,7 @@ background command process. It logs to `last-route-to-notarb.stdout.log` and
 `last-route-to-notarb.stderr.log`.
 
 It reads only `last-grpc-events.jsonl`, validates candidate pool-state accounts
-through the local 82 read-RPC tunnel, and writes `last-target-markets.json`
+through the configured local development reader, and writes `last-target-markets.json`
 plus `last-target-lookup-tables.txt`.
 Inspect the generated `last-target-route.json` and `last-target-status.json`
 for the current mint, pool group, ALT set, and whether it is active or held.
@@ -411,7 +452,8 @@ npm run test:last:bridge
 
 No mint or pool is hard-coded in the bot config. The bridge switches to a new
 LAST route only after verifying a complete, supported pool group and every
-route ALT through the local read-RPC tunnel. It writes `last-target-status.json`
+route ALT through the configured core reader (`http://82.39.215.201:8899` in
+production; the local tunnel is development-only). It writes `last-target-status.json`
 with `active` or `held`; a held status preserves the previous group and names
 the reason (for example, unsupported DEX or unreadable ALT). This is expected
 for an unknown protocol and is safer than loading arbitrary accounts.
@@ -450,9 +492,10 @@ when the lease becomes quiet, held, stale, or incoherent. Its logs are
 `last-notarb-live-supervisor.stdout.log` and
 `last-notarb-live-supervisor.stderr.log`.
 
-`[token_accounts_checker]` must match the indexed Helius `[[spam_rpc]]` URL.
-The 82 read RPC returns an account-secondary-index error for this bot wallet;
-the bridge and blockhash, price, market, and ALT reader roles remain on 82.
+`[token_accounts_checker]` must match the private indexed Helius `[[spam_rpc]]`
+endpoint. `[blockhash_updater]`, `[price_updater]`, `[market_loader]`, and
+`[lookup_table_loader]` must all use `http://82.39.215.201:8899`. The 82 reader
+is intentionally excluded only from the bot-wallet token-account index path.
 
 No private material should ever be committed. `.gitignore` excludes the local
 run config, wallet JSON files, event data, logs, and dependencies.

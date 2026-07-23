@@ -14,17 +14,20 @@ const execFileAsync = promisify(execFile);
 const root = resolve(process.cwd());
 const assertion = join(root, 'assert-last-live.mjs');
 const templatePath = join(root, 'notarb-last-grpc-live.example.toml');
-const readRpcUrl = 'http://82.39.215.201:8899';
 const heliusUrl = 'https://mainnet.helius-rpc.com/?api-key=fixture-indexed-key';
+const readerUrl = 'http://82.39.215.201:8899';
 const directory = await mkdtemp(join(tmpdir(), 'last-live-config-'));
 const configPath = join(directory, 'notarb-last-grpc-live.toml');
+const { LAST_READ_RPC_URL: _ignoredReadRpcUrl, ...environmentWithoutReadRpc } = process.env;
 
 async function runAssertion(config) {
   await writeFile(configPath, config, 'utf8');
   try {
     const result = await execFileAsync(process.execPath, [assertion, configPath], {
       cwd: directory,
-      env: { ...process.env, LAST_READ_RPC_URL: readRpcUrl },
+      // Leave LAST_READ_RPC_URL unset: the private live TOML's blockhash
+      // reader is the source of truth for all four reader/load RPC sections.
+      env: environmentWithoutReadRpc,
     });
     return { code: 0, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
   } catch (error) {
@@ -56,19 +59,24 @@ try {
   const template = await readFile(templatePath, 'utf8');
   const config = template
     .replace('REPLACE_WITH_DEDICATED_FUNDED_KEYPAIR.json', 'fixture-keypair.json')
-    .replaceAll('http://127.0.0.1:18899', readRpcUrl)
     .replaceAll('https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY', heliusUrl);
   await writeFile(join(directory, 'fixture-keypair.json'), '[]\n', 'utf8');
 
   // The v1.1.2 ordinary-RPC profile is a [[spam_rpc]] paired with
-  // spam_senders. Its token-account checker uses the same indexed Helius URL.
-  // threads=0 selects NotArb's dynamic cached executor thread pool.
+  // spam_senders. Core market readers use the recovered 82 reader; the token
+  // account checker and spam1 share the configured Helius URL. threads=0 is dynamic.
   await expectValid(config);
 
   await expectInvalid(
     'executor_enabled',
     config.replace('threads = 0', 'threads = 1'),
     '[transaction_executor] threads must be 0',
+  );
+
+  await expectInvalid(
+    'blockhash_delay_below_minimum',
+    config.replace('delay_ms = 1000', 'delay_ms = 999'),
+    '[blockhash_updater] delay_ms must be at least 1000',
   );
 
   await expectInvalid(
@@ -92,7 +100,7 @@ try {
   await expectInvalid(
     'reader_rpc_mismatch',
     config.replace(
-      `[market_loader]\nrpc_url = "${readRpcUrl}"`,
+      `[market_loader]\nrpc_url = "${readerUrl}"`,
       '[market_loader]\nrpc_url = "http://different-reader.invalid:8899"',
     ),
     '[market_loader] rpc_url must be',

@@ -11,6 +11,8 @@ import { chmod, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import process from 'node:process';
 
+const LAST_READER_RPC = 'http://82.39.215.201:8899';
+
 async function main() {
 const [configPath, ...options] = process.argv.slice(2);
 if (!configPath || options.length !== 0) {
@@ -45,6 +47,19 @@ const tokenChecker = document.exactlyOne('token_accounts_checker');
 if (tokenChecker.stringValue('rpc_url') !== spamUrl) {
   tokenChecker.setValue('rpc_url', JSON.stringify(spamUrl));
   changes.push('token_accounts_checker_spam_rpc');
+}
+
+const blockhashUpdater = document.exactlyOne('blockhash_updater');
+if (integerValue(blockhashUpdater, 'delay_ms') < 1000) {
+  blockhashUpdater.setValue('delay_ms', '1000');
+  changes.push('blockhash_updater_delay_ms');
+}
+for (const readerName of ['blockhash_updater', 'price_updater', 'market_loader', 'lookup_table_loader']) {
+  const reader = readerName === 'blockhash_updater' ? blockhashUpdater : document.exactlyOne(readerName);
+  if (reader.stringValue('rpc_url') !== LAST_READER_RPC) {
+    reader.setValue('rpc_url', JSON.stringify(LAST_READER_RPC));
+    changes.push(`${readerName}_last_reader`);
+  }
 }
 
 const strategy = document.exactlyOne('swap.strategy');
@@ -199,6 +214,18 @@ class TomlSection {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function integerValue(section, key) {
+  const value = section.value(key);
+  if (!/^[+-]?\d(?:_?\d)*$/.test(value)) {
+    fail(`[${section.name}] ${key} must be a TOML integer.`);
+  }
+  const parsed = Number(value.replaceAll('_', ''));
+  if (!Number.isSafeInteger(parsed)) {
+    fail(`[${section.name}] ${key} must be a safe TOML integer.`);
+  }
+  return parsed;
 }
 
 function fail(message) {

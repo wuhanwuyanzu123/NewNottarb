@@ -41,6 +41,12 @@ function encodedAccount(owner, size) {
   return { owner, data: [Buffer.alloc(size).toString('base64'), 'base64'] };
 }
 
+function encodedRaydiumClmmPool(owner) {
+  const data = Buffer.alloc(1544);
+  Buffer.from('f7ede3f5d7c3de46', 'hex').copy(data);
+  return { owner, data: [data.toString('base64'), 'base64'] };
+}
+
 function listen(server) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -88,12 +94,14 @@ try {
   const raydium = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
   const dlmm = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
   const orca = 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc';
+  const clmm = 'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK';
   const marketAccounts = new Map([
     ['market-11-raydium', encodedAccount(raydium, 752)],
     ['market-19-dlmm', encodedAccount(dlmm, 904)],
     ['market-28-dlmm', encodedAccount(dlmm, 904)],
     ['market-37-orca', encodedAccount(orca, 653)],
     ['market-45-dlmm', encodedAccount(dlmm, 904)],
+    ['market-55-clmm', encodedRaydiumClmmPool(clmm)],
   ]);
   const rpcServer = createServer(async (request, response) => {
     let text = '';
@@ -133,6 +141,9 @@ try {
             { position: 36, accountIndex: 136, pubkey: 'market-37-orca', source: 'lookup_table', writable: true, signer: false },
             { position: 43, accountIndex: 143, pubkey: dlmm, source: 'lookup_table', writable: false, signer: false },
             { position: 44, accountIndex: 144, pubkey: 'market-45-dlmm', source: 'lookup_table', writable: true, signer: false },
+            { position: 52, accountIndex: 152, pubkey: clmm, source: 'lookup_table', writable: false, signer: false },
+            { position: 53, accountIndex: 153, pubkey: 'clmm-amm-config-not-market', source: 'lookup_table', writable: false, signer: false },
+            { position: 54, accountIndex: 154, pubkey: 'market-55-clmm', source: 'lookup_table', writable: true, signer: false },
           ],
         }],
       },
@@ -146,6 +157,7 @@ try {
           { programId: raydium, label: 'Raydium AMM v4' },
           { programId: dlmm, label: 'Meteora DLMM' },
           { programId: orca, label: 'Orca Whirlpool' },
+          { programId: clmm, label: 'Raydium CLMM' },
         ],
       },
       execution: { kind: 'no_fill', invokedPrograms: [] },
@@ -178,6 +190,7 @@ try {
       'market-28-dlmm',
       'market-37-orca',
       'market-45-dlmm',
+      'market-55-clmm',
     ]];
     if (!Number.isInteger(markets.update_timestamp) || JSON.stringify(markets.groups) !== JSON.stringify(expectedGroup)) {
       throw new Error(`unexpected_notarb_markets_file:${JSON.stringify(markets)}`);

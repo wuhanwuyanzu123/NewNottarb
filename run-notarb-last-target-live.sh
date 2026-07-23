@@ -24,6 +24,19 @@ if [[ -z "$NODE_BIN" ]]; then
   printf '%s\n' '{"status":"last_live_start_rejected","reason":"node_not_found"}' >>"$ERR_LOG"
   exit 127
 fi
+CONFIGURED_READ_RPC="$("$NODE_BIN" "$ROOT/last-live-reader-rpc.mjs" "$CONFIG")" || {
+  printf '%s\n' '{"status":"last_live_start_rejected","reason":"invalid_reader_rpc"}' >>"$ERR_LOG"
+  exit 2
+}
+# Do not inherit a stale reader from a systemd drop-in. The explicit override
+# remains available only to local fixture work that deliberately opts in;
+# production always uses the configured 82 reader.
+if [[ "${LAST_ROUTE_ALLOW_RPC_OVERRIDE:-false}" == "true" && -n "${LAST_READ_RPC_URL:-}" ]]; then
+  :
+else
+  LAST_READ_RPC_URL="$CONFIGURED_READ_RPC"
+fi
+export LAST_READ_RPC_URL
 "$NODE_BIN" "$ROOT/assert-last-live.mjs" "$CONFIG" >>"$OUT_LOG" 2>>"$ERR_LOG"
 
 # Prefer an official Linux NotArb launcher when one is installed.  The 82.23

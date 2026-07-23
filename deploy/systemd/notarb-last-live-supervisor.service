@@ -10,7 +10,6 @@ WorkingDirectory=/opt/notarb-last/current
 UMask=0077
 Environment=NODE_BIN=/usr/bin/node
 Environment=LAST_LIVE_CONFIG=/etc/notarb-last/notarb-last-grpc-live.toml
-Environment=LAST_READ_RPC_URL=http://82.39.215.201:8899
 Environment=LAST_IDLE_SECONDS=120
 Environment=NOTARB_JAVA_BIN=/usr/bin/java
 Environment=NOTARB_JAR=/var/lib/notarb-last/notarb-1.1.2.jar

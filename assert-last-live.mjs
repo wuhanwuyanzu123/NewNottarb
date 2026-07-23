@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 // Guard the local LAST live runner. It checks that the process remains
 // target-only while explicitly enabling one ordinary Helius RPC sender and
-// flash loans. All ordinary reader/load RPCs must match LAST_READ_RPC_URL;
-// the token-account checker must use the same indexed Helius endpoint as the
-// ordinary spam sender because the 82.39 read node does not expose arbitrary
-// wallet token-account secondary indexes.
+// flash loans. The recovered 82 reader supplies blockhash, price, market, and
+// ALT data; the token-account secondary-index check and ordinary spam sender
+// use the one private Helius endpoint.
 
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
@@ -12,11 +11,7 @@ import process from 'node:process';
 
 const configPath = process.argv[2];
 if (!configPath) fail('Usage: node assert-last-live.mjs <config.toml>');
-const readRpcUrl = process.env.LAST_READ_RPC_URL ?? 'http://127.0.0.1:18899';
-if (!/^https?:\/\/[^\s]+$/i.test(readRpcUrl) || /REPLACE_WITH_/i.test(readRpcUrl)) {
-  fail('LAST_READ_RPC_URL must be a configured HTTP(S) read RPC endpoint.');
-}
-const expectedReadRpcValue = JSON.stringify(readRpcUrl);
+const LAST_READER_RPC = 'http://82.39.215.201:8899';
 const isConfiguredHeliusMainnetRpc = (value) => (
   /^https:\/\/mainnet\.helius-rpc\.com\/\?api-key=.+$/i.test(value)
   && !/REPLACE_WITH_/i.test(value)
@@ -83,6 +78,18 @@ if (!isConfiguredHeliusMainnetRpc(tokenAccountsRpc)) {
   fail('[token_accounts_checker] rpc_url must be a configured indexed Helius mainnet RPC endpoint.');
 }
 expect(tokenAccounts, 'delay_seconds', '3');
+const blockhashUpdater = exactlyOne('blockhash_updater');
+const configuredReadRpc = stringValue(blockhashUpdater, 'rpc_url');
+if (integerValue(blockhashUpdater, 'delay_ms') < 1000) {
+  fail('[blockhash_updater] delay_ms must be at least 1000.');
+}
+if (configuredReadRpc !== LAST_READER_RPC) {
+  fail(`[blockhash_updater] rpc_url must be ${LAST_READER_RPC}.`);
+}
+if (process.env.LAST_READ_RPC_URL && process.env.LAST_READ_RPC_URL !== configuredReadRpc) {
+  fail('LAST_READ_RPC_URL must match the configured 82 reader RPC.');
+}
+const expectedReadRpcValue = JSON.stringify(configuredReadRpc);
 for (const readRpcSection of ['blockhash_updater', 'price_updater', 'market_loader', 'lookup_table_loader']) {
   expect(exactlyOne(readRpcSection), 'rpc_url', expectedReadRpcValue);
 }
@@ -132,4 +139,16 @@ console.log(JSON.stringify({
 function fail(message) {
   console.error(JSON.stringify({ status: 'last_live_config_invalid', message }));
   process.exit(1);
+}
+
+function integerValue(sectionValue, key) {
+  const value = sectionValue.values.get(key);
+  if (!value || !/^[+-]?\d(?:_?\d)*$/.test(value)) {
+    fail(`[${sectionValue.name}] ${key} must be a TOML integer.`);
+  }
+  const parsed = Number(value.replaceAll('_', ''));
+  if (!Number.isSafeInteger(parsed)) {
+    fail(`[${sectionValue.name}] ${key} must be a safe TOML integer.`);
+  }
+  return parsed;
 }

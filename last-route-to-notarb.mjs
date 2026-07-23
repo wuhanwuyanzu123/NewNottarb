@@ -36,6 +36,15 @@ const POOL_LAYOUTS = new Map([
   ['cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG', { label: 'Meteora CPMM', sizes: new Set([1112]), marketOffset: 2 }],
   ['LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo', { label: 'Meteora DLMM', sizes: new Set([904]), marketOffset: 1 }],
   ['whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', { label: 'Orca Whirlpool', sizes: new Set([653]), marketOffset: 1 }],
+  // Raydium CLMM uses +1 for readonly AmmConfig and +2 for writable
+  // PoolState. The exact size/discriminator were checked against observed
+  // LAST route accounts before enabling this legacy bridge fallback.
+  ['CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', {
+    label: 'Raydium CLMM',
+    sizes: new Set([1544]),
+    discriminator: Buffer.from('f7ede3f5d7c3de46', 'hex'),
+    marketOffset: 2,
+  }],
 ]);
 
 const args = parseArgs(process.argv.slice(2));
@@ -327,6 +336,7 @@ function routePools(event, candidates, accounts) {
     if (!layout || !encoded) continue;
     const data = Buffer.from(encoded, 'base64');
     if (!layout.sizes.has(data.length)) continue;
+    if (layout.discriminator && !data.subarray(0, layout.discriminator.length).equals(layout.discriminator)) continue;
     const matches = targets.filter((target) => includesBytes(data, target.bytes));
     // A fresh NA instruction supplies the complete market route. Intermediate
     // WSOL-USDC or target-USDC legs may not contain the headline target mint.

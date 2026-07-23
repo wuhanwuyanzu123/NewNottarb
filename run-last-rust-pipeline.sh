@@ -3,11 +3,11 @@ set -euo pipefail
 
 # WSL/Linux LAST pipeline: the Yellowstone observer is append-only, while the
 # compiled Rust bridge owns target market generation and the small lease state.
-# LAST_READ_RPC_URL supports either a local development forward or a direct
-# server-side read RPC.
+# The private live TOML names the recovered 82 read RPC. The ordinary Helius
+# endpoint remains confined to NotArb's direct spam sender configuration.
 
 ROOT="${LAST_ROUTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-READ_RPC_URL="${LAST_READ_RPC_URL:-http://127.0.0.1:18899}"
+LIVE_CONFIG="${LAST_LIVE_CONFIG:-/etc/notarb-last/notarb-last-grpc-live.toml}"
 # NotArb needs time to load the user, prices, markets, and ALT set before it
 # can quote. Retain the last validated LAST route while confirmed
 # LAST-signed activity continues, then publish `held` two minutes after that
@@ -27,6 +27,28 @@ if [[ -z "$NODE_BIN" ]]; then
   echo '{"status":"rust_pipeline_start_failed","reason":"node_not_found"}' >&2
   exit 127
 fi
+
+if [[ ! -r "$LIVE_CONFIG" ]]; then
+  echo '{"status":"rust_pipeline_start_failed","reason":"live_config_unreadable"}' >&2
+  exit 2
+fi
+CONFIGURED_READ_RPC="$("$NODE_BIN" "$ROOT/last-live-reader-rpc.mjs" "$LIVE_CONFIG")" || {
+  echo '{"status":"rust_pipeline_start_failed","reason":"invalid_reader_rpc"}' >&2
+  exit 2
+}
+# An explicit override is useful only for isolated local fixture work. It is
+# opt-in, so an old systemd environment file cannot accidentally change the
+# configured production reader.
+if [[ "${LAST_ROUTE_ALLOW_RPC_OVERRIDE:-false}" == "true" && -n "${LAST_READ_RPC_URL:-}" ]]; then
+  READ_RPC_URL="$LAST_READ_RPC_URL"
+else
+  READ_RPC_URL="$CONFIGURED_READ_RPC"
+fi
+if [[ ! "$READ_RPC_URL" =~ ^https?:// ]]; then
+  echo '{"status":"rust_pipeline_start_failed","reason":"invalid_reader_rpc"}' >&2
+  exit 2
+fi
+export LAST_READ_RPC_URL="$READ_RPC_URL"
 OBSERVER_LOG="$ROOT/last-grpc-rust-runtime.stdout.log"
 OBSERVER_ERR="$ROOT/last-grpc-rust-runtime.stderr.log"
 BRIDGE_LOG="$ROOT/last-route-rust.stdout.log"
@@ -41,7 +63,7 @@ trap cleanup EXIT INT TERM
 
 "$NODE_BIN" "$ROOT/grpc-last.mjs" --root="$ROOT" --no-state >>"$OBSERVER_LOG" 2>>"$OBSERVER_ERR" &
 OBSERVER_PID=$!
-bash "$ROOT/rust/last-route-bridge/run-wsl.sh" --interval="$BRIDGE_INTERVAL_MS" --max-observer-staleness-seconds="$OBSERVER_STALENESS_SECONDS" --rpc="$READ_RPC_URL" >>"$BRIDGE_LOG" 2>>"$BRIDGE_ERR" &
+bash "$ROOT/rust/last-route-bridge/run-wsl.sh" --interval="$BRIDGE_INTERVAL_MS" --max-observer-staleness-seconds="$OBSERVER_STALENESS_SECONDS" >>"$BRIDGE_LOG" 2>>"$BRIDGE_ERR" &
 BRIDGE_PID=$!
 
 wait -n "$OBSERVER_PID" "$BRIDGE_PID"

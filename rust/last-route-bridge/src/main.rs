@@ -24,12 +24,24 @@ const MAX_GET_MULTIPLE_ACCOUNTS_ADDRESSES: usize = 50;
 // Keep that tiny file fresh without re-reading the historical JSONL or
 // revalidating pools on every 250 ms bridge tick.
 const ACTIVE_MARKETS_HEARTBEAT: Duration = Duration::from_secs(5);
+// The bridge normally polls every 250 ms, which is useful for a newly
+// observed route but too aggressive after a reader has returned a 429 or a
+// transient transport failure. Retry the exact same unvalidated input with a
+// small bounded exponential delay; a changed route/activity input bypasses
+// this delay immediately.
+const FAILED_ROUTE_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const FAILED_ROUTE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 struct PoolLayout {
     program_id: &'static str,
     label: &'static str,
     sizes: &'static [usize],
+    // Most layouts are already unambiguous from owner and exact account size.
+    // Raydium CLMM's program also owns smaller configuration accounts, so its
+    // verified PoolState discriminator prevents a nearby configuration meta
+    // from becoming a NotArb market input.
+    discriminator: Option<&'static [u8]>,
     // The NotArb instruction supplies a DEX program followed by the concrete
     // market-state account that NotArb expects in markets_file. CPMM has an
     // event-authority account between those two entries.
@@ -41,24 +53,28 @@ const POOL_LAYOUTS: &[PoolLayout] = &[
         program_id: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
         label: "Raydium AMM v4",
         sizes: &[752],
+        discriminator: None,
         market_offset: 1,
     },
     PoolLayout {
         program_id: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
         label: "Pump.fun AMM",
         sizes: &[301],
+        discriminator: None,
         market_offset: 1,
     },
     PoolLayout {
         program_id: "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",
         label: "Meteora CPMM",
         sizes: &[1112],
+        discriminator: None,
         market_offset: 2,
     },
     PoolLayout {
         program_id: "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
         label: "Meteora DLMM",
         sizes: &[904],
+        discriminator: None,
         market_offset: 1,
     },
     // Orca Whirlpool::LEN is 653 bytes (including Anchor discriminator).
@@ -66,7 +82,18 @@ const POOL_LAYOUTS: &[PoolLayout] = &[
         program_id: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
         label: "Orca Whirlpool",
         sizes: &[653],
+        discriminator: None,
         market_offset: 1,
+    },
+    // In a Raydium CLMM NotArb instruction, +1 is the readonly AmmConfig and
+    // +2 is the writable 1,544-byte PoolState. These bytes were verified on
+    // two distinct observed LAST route legs before allowing the layout.
+    PoolLayout {
+        program_id: "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+        label: "Raydium CLMM",
+        sizes: &[1544],
+        discriminator: Some(&[0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46]),
+        market_offset: 2,
     },
 ];
 
@@ -134,6 +161,13 @@ struct RetainedLease {
     groups: Value,
 }
 
+struct FailedRouteRetry {
+    input_key: String,
+    stale: bool,
+    consecutive_failures: u32,
+    retry_not_before: Instant,
+}
+
 // A missing JSONL file is normal while the observer is starting, and a JSONL
 // stream can legitimately contain transactions that are unrelated to a
 // usable LAST route.  Keep those cases distinct from malformed completed
@@ -169,6 +203,7 @@ struct BridgeCache {
     activity: Option<Value>,
     last_input_key: Option<String>,
     last_input_stale: Option<bool>,
+    failed_route_retry: Option<FailedRouteRetry>,
     last_markets_heartbeat: Option<Instant>,
 }
 
@@ -176,7 +211,7 @@ fn main() {
     if let Err(error) = run() {
         eprintln!(
             "{}",
-            json!({"status":"last_route_bridge_fatal","error":format!("{error:#}")})
+            json!({"status":"last_route_bridge_fatal","error":redact_error_message(&format!("{error:#}"))})
         );
         process::exit(1);
     }
@@ -189,7 +224,7 @@ fn run() -> Result<()> {
         if let Err(error) = build_with_cache(&options, &mut cache) {
             eprintln!(
                 "{}",
-                json!({"status":"target_markets_error","error":format!("{error:#}")})
+                json!({"status":"target_markets_error","error":redact_error_message(&format!("{error:#}"))})
             );
         }
         if options.once {
@@ -228,11 +263,14 @@ fn parse_options() -> Result<Options> {
         .and_then(Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("last-grpc-activity.json"));
-    let rpc_url = values
-        .get("rpc")
-        .and_then(Value::as_str)
-        .unwrap_or("http://127.0.0.1:18899")
-        .to_owned();
+    // A private Helius reader URL carries an API key.  Prefer an explicit
+    // --rpc flag for local development, then use the service environment so
+    // production does not expose that URL in the bridge command line (ps).
+    let environment_rpc_url = env::var("LAST_READ_RPC_URL").ok();
+    let rpc_url = resolve_rpc_url(
+        values.get("rpc").and_then(Value::as_str),
+        environment_rpc_url.as_deref(),
+    );
     let interval_ms = bounded_u64(
         values.get("interval").and_then(Value::as_str),
         5_000,
@@ -262,11 +300,106 @@ fn parse_options() -> Result<Options> {
     })
 }
 
+fn resolve_rpc_url(explicit_rpc_url: Option<&str>, environment_rpc_url: Option<&str>) -> String {
+    explicit_rpc_url
+        .or(environment_rpc_url)
+        .unwrap_or("http://127.0.0.1:18899")
+        .to_owned()
+}
+
+fn redact_error_message(message: &str) -> String {
+    const REDACTED_RPC_URL: &str = "[redacted_rpc_url]";
+    let mut redacted = String::with_capacity(message.len());
+    let mut cursor = 0;
+    while cursor < message.len() {
+        let remaining = &message[cursor..];
+        let http = remaining.find("http://").map(|offset| cursor + offset);
+        let https = remaining.find("https://").map(|offset| cursor + offset);
+        let Some(start) = (match (http, https) {
+            (Some(http), Some(https)) => Some(http.min(https)),
+            (Some(start), None) | (None, Some(start)) => Some(start),
+            (None, None) => None,
+        }) else {
+            redacted.push_str(remaining);
+            break;
+        };
+        redacted.push_str(&message[cursor..start]);
+        let end = message[start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                (offset > 0
+                    && (character.is_whitespace()
+                        || matches!(
+                            character,
+                            '"' | '\''
+                                | '`'
+                                | '('
+                                | ')'
+                                | '['
+                                | ']'
+                                | '{'
+                                | '}'
+                                | '<'
+                                | '>'
+                                | ','
+                                | ';'
+                        )))
+                .then_some(start + offset)
+            })
+            .unwrap_or(message.len());
+        redacted.push_str(REDACTED_RPC_URL);
+        cursor = end;
+    }
+    redacted
+}
+
 fn bounded_u64(value: Option<&str>, fallback: u64, minimum: u64, maximum: u64) -> u64 {
     value
         .and_then(|item| item.parse::<u64>().ok())
         .map(|item| item.clamp(minimum, maximum))
         .unwrap_or(fallback)
+}
+
+fn failed_route_retry_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(5);
+    let seconds = FAILED_ROUTE_RETRY_INITIAL
+        .as_secs()
+        .saturating_mul(1_u64 << exponent)
+        .min(FAILED_ROUTE_RETRY_MAX.as_secs());
+    Duration::from_secs(seconds)
+}
+
+fn failed_route_retry_is_pending(
+    cache: &BridgeCache,
+    input_key: &str,
+    stale: bool,
+    now: Instant,
+) -> bool {
+    cache.failed_route_retry.as_ref().is_some_and(|retry| {
+        retry.input_key == input_key && retry.stale == stale && now < retry.retry_not_before
+    })
+}
+
+fn record_failed_route_retry(
+    cache: &mut BridgeCache,
+    input_key: &str,
+    stale: bool,
+    now: Instant,
+) -> Duration {
+    let consecutive_failures = cache
+        .failed_route_retry
+        .as_ref()
+        .filter(|retry| retry.input_key == input_key && retry.stale == stale)
+        .map(|retry| retry.consecutive_failures.saturating_add(1))
+        .unwrap_or(1);
+    let delay = failed_route_retry_delay(consecutive_failures);
+    cache.failed_route_retry = Some(FailedRouteRetry {
+        input_key: input_key.to_owned(),
+        stale,
+        consecutive_failures,
+        retry_not_before: now + delay,
+    });
+    delay
 }
 
 fn now_iso() -> String {
@@ -899,7 +1032,11 @@ fn route_pools(
         let Some(data) = account.data.as_deref() else {
             continue;
         };
-        if !layout.sizes.contains(&data.len()) {
+        if !layout.sizes.contains(&data.len())
+            || layout
+                .discriminator
+                .is_some_and(|discriminator| !data.starts_with(discriminator))
+        {
             continue;
         }
         let target_mints = targets
@@ -1299,6 +1436,113 @@ fn publish_observer_state(
     Ok(changed)
 }
 
+// An observer receipt is the supervisor's proof that an active status has
+// been validated. Publish it immediately before the matching active status;
+// reader RPC failures never reach this function.
+fn publish_active_route_status(
+    observer_state_path: &Path,
+    status_path: &Path,
+    activity: &Value,
+    route: &Value,
+    route_evidence_fingerprint: &str,
+    stale: bool,
+    status: Value,
+) -> Result<bool> {
+    publish_observer_state(
+        observer_state_path,
+        activity,
+        route,
+        route_evidence_fingerprint,
+        stale,
+    )?;
+    publish_status(status_path, status)
+}
+
+// A held status must stop any previous child before its observer receipt can
+// advance to a route that has not yielded a new active generation. The
+// supervisor does not consult observer state while status is non-active, so
+// this ordering is fail-closed if writing the observer receipt itself fails.
+fn publish_held_route_status(
+    observer_state_path: &Path,
+    status_path: &Path,
+    activity: &Value,
+    route: &Value,
+    route_evidence_fingerprint: &str,
+    stale: bool,
+    status: Value,
+) -> Result<bool> {
+    let changed = publish_status(status_path, status)?;
+    publish_observer_state(
+        observer_state_path,
+        activity,
+        route,
+        route_evidence_fingerprint,
+        stale,
+    )?;
+    Ok(changed)
+}
+
+fn publish_reader_retry_held_status(
+    options: &Options,
+    event: &Value,
+    activity_event: &Value,
+    stale: bool,
+    retry_delay: Duration,
+    consecutive_failures: u32,
+) -> Result<()> {
+    let (_, _, _, status_path, _, observer_state_path) = status_paths(&options.root);
+    let route_evidence_fingerprint = json_route_evidence_fingerprint(event);
+    let source = source_for(event);
+    let observer = observer_for(activity_event, event, &route_evidence_fingerprint, stale);
+    let activity = json!({
+        "signature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
+        "slot":activity_event.get("slot").cloned().unwrap_or(Value::Null),
+        "observedAt":activity_event.get("observedAt").cloned().unwrap_or(Value::Null),
+        "routeEvidenceFingerprint":route_evidence_fingerprint.clone(),
+    });
+    let details = json!({
+        "retryAfterMs":retry_delay.as_millis(),
+        "consecutiveFailures":consecutive_failures,
+        "validation":"reader_rpc",
+    });
+    let fingerprint = sha256(&json!({
+        "status":"held",
+        "reason":"reader_retry",
+        "source":source.clone(),
+        "details":details.clone(),
+    }));
+    let status = json!({
+        "status":"held",
+        "reason":"reader_retry",
+        "fingerprint":fingerprint,
+        "source":source.clone(),
+        "observer":observer,
+        "activity":activity,
+        "activeTarget":Value::Null,
+        "details":details.clone(),
+    });
+    if publish_held_route_status(
+        &observer_state_path,
+        &status_path,
+        activity_event,
+        event,
+        &route_evidence_fingerprint,
+        stale,
+        status,
+    )? {
+        eprintln!(
+            "{}",
+            json!({
+                "status":"target_route_held",
+                "reason":"reader_retry",
+                "source":source,
+                "details":details,
+            })
+        );
+    }
+    Ok(())
+}
+
 // The derived market set can stay the same while the observed LAST route
 // evidence changes (for example, the ALT selections or writable route
 // accounts change).  In that case the active generation is intentionally
@@ -1485,6 +1729,7 @@ fn build_with_cache(options: &Options, cache: &mut BridgeCache) -> Result<()> {
             if result.is_ok() {
                 cache.last_input_key = Some(input_key);
                 cache.last_input_stale = None;
+                cache.failed_route_retry = None;
             }
             result
         }
@@ -1500,6 +1745,10 @@ fn build_with_cache(options: &Options, cache: &mut BridgeCache) -> Result<()> {
                 "activitySignature":activity_event.get("signature").cloned().unwrap_or(Value::Null),
                 "activityObservedAt":activity_event.get("observedAt").cloned().unwrap_or(Value::Null),
             }));
+            let now = Instant::now();
+            if failed_route_retry_is_pending(cache, &input_key, stale, now) {
+                return Ok(());
+            }
             if cache.last_input_key.as_deref() == Some(input_key.as_str())
                 && cache.last_input_stale == Some(stale)
             {
@@ -1508,13 +1757,37 @@ fn build_with_cache(options: &Options, cache: &mut BridgeCache) -> Result<()> {
                 }
                 return Ok(());
             }
-            let result = build_route(options, event, activity_event, stale);
-            if result.is_ok() {
-                cache.last_input_key = Some(input_key);
-                cache.last_input_stale = Some(stale);
-                cache.last_markets_heartbeat = Some(Instant::now());
+            match build_route(options, event.clone(), activity_event.clone(), stale) {
+                Ok(()) => {
+                    cache.last_input_key = Some(input_key);
+                    cache.last_input_stale = Some(stale);
+                    cache.failed_route_retry = None;
+                    cache.last_markets_heartbeat = Some(Instant::now());
+                    Ok(())
+                }
+                Err(error) => {
+                    let retry_delay =
+                        record_failed_route_retry(cache, &input_key, stale, Instant::now());
+                    let consecutive_failures = cache
+                        .failed_route_retry
+                        .as_ref()
+                        .expect("failed route retry recorded")
+                        .consecutive_failures;
+                    if let Err(hold_error) = publish_reader_retry_held_status(
+                        options,
+                        &event,
+                        &activity_event,
+                        stale,
+                        retry_delay,
+                        consecutive_failures,
+                    ) {
+                        return Err(error.context(format!(
+                            "also failed to publish reader_retry hold: {hold_error:#}"
+                        )));
+                    }
+                    Err(error)
+                }
             }
-            result
         }
     }
 }
@@ -1537,13 +1810,6 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
         "observedAt":activity_event.get("observedAt").cloned().unwrap_or(Value::Null),
         "routeEvidenceFingerprint":route_evidence_fingerprint,
     });
-    publish_observer_state(
-        &observer_state_path,
-        &activity_event,
-        &event,
-        &route_evidence_fingerprint,
-        stale,
-    )?;
     let bridge_state = read_json_if_present(&bridge_state_path)?;
     let active_target = bridge_state.as_ref().map(|state| {
         json!({
@@ -1564,7 +1830,15 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             "activeTarget":active_target,
             "details":details,
         });
-        if publish_status(&status_path, status)? {
+        if publish_held_route_status(
+            &observer_state_path,
+            &status_path,
+            &activity_event,
+            &event,
+            &route_evidence_fingerprint,
+            stale,
+            status,
+        )? {
             eprintln!(
                 "{}",
                 json!({"status":"target_route_held","reason":reason,"source":source,"details":details})
@@ -1630,7 +1904,15 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
                 "observer":observer,
                 "activity":activity,
             });
-            publish_status(&status_path, status)?;
+            publish_active_route_status(
+                &observer_state_path,
+                &status_path,
+                &activity_event,
+                &event,
+                &route_evidence_fingerprint,
+                stale,
+                status,
+            )?;
             println!(
                 "{}",
                 json!({
@@ -1770,7 +2052,15 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
             "observer":observer,
             "activity":activity,
         });
-        publish_status(&status_path, status)?;
+        publish_active_route_status(
+            &observer_state_path,
+            &status_path,
+            &activity_event,
+            &event,
+            &route_evidence_fingerprint,
+            stale,
+            status,
+        )?;
         return Ok(());
     }
     let generation = bridge_state
@@ -1884,7 +2174,15 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
         "pools":pools.iter().map(|pool| json!({"address":pool.address,"dex":pool.label,"containsWsol":pool.contains_wsol})).collect::<Vec<_>>(),
         "groups":groups,
     });
-    publish_status(&status_path, status)?;
+    publish_active_route_status(
+        &observer_state_path,
+        &status_path,
+        &activity_event,
+        &event,
+        &route_evidence_fingerprint,
+        stale,
+        status,
+    )?;
     println!(
         "{}",
         json!({
@@ -1905,7 +2203,15 @@ fn build_route(options: &Options, event: Value, activity_event: Value, stale: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc,
+        },
+        thread,
+    };
 
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1933,6 +2239,29 @@ mod tests {
             once: true,
             max_markets: 4,
         }
+    }
+
+    fn rate_limited_reader(
+        request_count: usize,
+    ) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind rate-limited reader");
+        let endpoint = format!("http://{}", listener.local_addr().expect("reader address"));
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_by_server = Arc::clone(&served);
+        let server = thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut socket, _) = listener.accept().expect("accept reader request");
+                served_by_server.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0_u8; 4_096];
+                let _ = socket.read(&mut request);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("write rate-limit response");
+            }
+        });
+        (endpoint, served, server)
     }
 
     fn fixture_route_event(signature: &str, observed_at: &str) -> Value {
@@ -1981,11 +2310,348 @@ mod tests {
     }
 
     #[test]
+    fn rpc_url_resolution_prioritizes_explicit_then_environment_then_default() {
+        let environment_reader = "http://environment-reader.invalid:8899";
+
+        assert_eq!(
+            resolve_rpc_url(
+                Some("http://explicit-reader.invalid:8899"),
+                Some(environment_reader),
+            ),
+            "http://explicit-reader.invalid:8899",
+            "an explicit --rpc value must override the service environment"
+        );
+        assert_eq!(
+            resolve_rpc_url(None, Some(environment_reader)),
+            environment_reader,
+            "the private service environment must be used when --rpc is absent"
+        );
+        assert_eq!(
+            resolve_rpc_url(None, None),
+            "http://127.0.0.1:18899",
+            "local development retains the loopback fallback"
+        );
+    }
+
+    #[test]
+    fn error_logging_redacts_rpc_urls_but_keeps_status_diagnostics() {
+        let message = "getMultipleAccounts request: https://reader.example/?api-key=secret-value: http status: 429 Too Many Requests; fallback http://127.0.0.1:18899/path";
+        let redacted = redact_error_message(message);
+        assert!(!redacted.contains("secret-value"));
+        assert!(!redacted.contains("reader.example"));
+        assert!(!redacted.contains("127.0.0.1:18899"));
+        assert_eq!(redacted.matches("[redacted_rpc_url]").count(), 2);
+        assert!(redacted.contains("429 Too Many Requests"));
+    }
+
+    fn assert_status_observer_is_coherent(status: &Value, observer_state: &Value) {
+        for key in [
+            "lastObservedAt",
+            "lastSignature",
+            "lastSlot",
+            "lastRouteObservedAt",
+            "lastRouteSignature",
+            "lastRouteSlot",
+            "stale",
+        ] {
+            assert_eq!(
+                value_path(status, &["observer", key]),
+                observer_state.get(key),
+                "status observer field {key} must match persisted observer state"
+            );
+        }
+        assert_eq!(
+            value_path(status, &["observer", "routeEvidenceFingerprint"]),
+            observer_state.get("lastRouteFingerprint"),
+            "the status route evidence must match the persisted observer state"
+        );
+    }
+
+    #[test]
+    fn failed_route_retry_is_bounded_and_allows_a_fresh_input_immediately() {
+        assert_eq!(
+            (1..=7).map(failed_route_retry_delay).collect::<Vec<_>>(),
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ],
+            "reader retries must grow without exceeding the configured cap"
+        );
+
+        let now = Instant::now();
+        let mut cache = BridgeCache::default();
+        let first_delay = record_failed_route_retry(&mut cache, "route-a", false, now);
+        assert_eq!(first_delay, Duration::from_secs(1));
+        assert!(failed_route_retry_is_pending(
+            &cache,
+            "route-a",
+            false,
+            now + Duration::from_millis(250)
+        ));
+        assert!(
+            !failed_route_retry_is_pending(
+                &cache,
+                "route-b",
+                false,
+                now + Duration::from_millis(250)
+            ),
+            "a fresh route input must not inherit a previous route's retry delay"
+        );
+
+        let retry_at = cache
+            .failed_route_retry
+            .as_ref()
+            .expect("failed route retry exists")
+            .retry_not_before;
+        assert!(!failed_route_retry_is_pending(
+            &cache, "route-a", false, retry_at
+        ));
+        assert_eq!(
+            record_failed_route_retry(&mut cache, "route-a", false, retry_at),
+            Duration::from_secs(2),
+            "the same failed input backs off exponentially after its next failed attempt"
+        );
+    }
+
+    #[test]
+    fn validated_active_status_commits_matching_observer_state() {
+        let directory = fixture_directory("active-observer-status");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let (_, _, _, status_path, _, observer_state_path) = status_paths(&directory);
+        let observed = now_iso();
+        let route = fixture_route_event("validated-active-route", &observed);
+        let fingerprint = json_route_evidence_fingerprint(&route);
+        let status = json!({
+            "status":"active",
+            "reason":"target_auto_follow",
+            "fingerprint":"fixture-active",
+            "generation":1,
+            "source":source_for(&route),
+            "observer":observer_for(&route, &route, &fingerprint, false),
+            "activity":{
+                "signature":route.get("signature").cloned().unwrap_or(Value::Null),
+                "observedAt":route.get("observedAt").cloned().unwrap_or(Value::Null),
+                "routeEvidenceFingerprint":fingerprint,
+            },
+        });
+
+        assert!(publish_active_route_status(
+            &observer_state_path,
+            &status_path,
+            &route,
+            &route,
+            &json_route_evidence_fingerprint(&route),
+            false,
+            status,
+        )
+        .expect("publish validated active status"));
+        let persisted_status = read_json_if_present(&status_path)
+            .expect("read active status")
+            .expect("active status exists");
+        let persisted_observer = read_json_if_present(&observer_state_path)
+            .expect("read observer state")
+            .expect("observer state exists");
+        assert_status_observer_is_coherent(&persisted_status, &persisted_observer);
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn failed_rpc_validation_holds_prior_child_and_backs_off_same_input() {
+        let directory = fixture_directory("failed-reader-retry");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let mut options = offline_options(directory.clone(), events);
+        let (reader_url, reader_requests, reader_server) = rate_limited_reader(2);
+        options.rpc_url = reader_url;
+
+        let prior_observed = now_iso();
+        let prior_route = fixture_route_event("previous-validated-route", &prior_observed);
+        let prior_fingerprint = json_route_evidence_fingerprint(&prior_route);
+        let prior_observer = state_for(&prior_route, &prior_route, &prior_fingerprint, false);
+        let prior_status = json!({
+            "status":"active",
+            "reason":"target_auto_follow",
+            "fingerprint":"previous-generation",
+            "generation":1,
+            "source":source_for(&prior_route),
+            "observer":observer_for(&prior_route, &prior_route, &prior_fingerprint, false),
+            "activity":{
+                "signature":prior_route.get("signature").cloned().unwrap_or(Value::Null),
+                "observedAt":prior_route.get("observedAt").cloned().unwrap_or(Value::Null),
+                "routeEvidenceFingerprint":prior_fingerprint,
+            },
+        });
+        let (_, _, _, status_path, _, observer_state_path) = status_paths(&directory);
+        write_json_atomically(&observer_state_path, &prior_observer)
+            .expect("write previous observer");
+        write_json_atomically(&status_path, &prior_status).expect("write previous active status");
+
+        let unvalidated_route = fixture_route_event("reader-failure-route", &now_iso());
+        write_json_atomically(&options.route_receipt, &unvalidated_route)
+            .expect("write fresh route receipt");
+        let mut cache = BridgeCache::default();
+        let first = build_with_cache(&options, &mut cache);
+        assert!(first.is_err(), "429 reader response must fail validation");
+        assert_eq!(reader_requests.load(Ordering::SeqCst), 1);
+        let held_status = read_json_if_present(&status_path)
+            .expect("read reader-retry status")
+            .expect("reader-retry status exists");
+        let held_observer = read_json_if_present(&observer_state_path)
+            .expect("read reader-retry observer")
+            .expect("reader-retry observer exists");
+        assert_eq!(held_status.get("status"), Some(&json!("held")));
+        assert_eq!(held_status.get("reason"), Some(&json!("reader_retry")));
+        assert_eq!(
+            value_path(&held_status, &["activity", "signature"]),
+            Some(&json!("reader-failure-route")),
+            "a failed fresh route must stop the old child rather than leave its old active lease"
+        );
+        assert_ne!(held_status, prior_status);
+        assert_ne!(held_observer, prior_observer);
+        assert_status_observer_is_coherent(&held_status, &held_observer);
+
+        let held_status_before_retry = held_status.clone();
+        assert!(
+            build_with_cache(&options, &mut cache).is_ok(),
+            "the same failed route is suppressed until its bounded retry deadline"
+        );
+        assert_eq!(
+            reader_requests.load(Ordering::SeqCst),
+            1,
+            "a 250 ms bridge tick must not make another reader request during backoff"
+        );
+        assert_eq!(
+            read_json_if_present(&status_path)
+                .expect("read unchanged held status")
+                .expect("held status still exists"),
+            held_status_before_retry,
+            "the suppressed retry must not churn the held lease"
+        );
+
+        let fresh_route = fixture_route_event("fresh-route-bypasses-backoff", &now_iso());
+        write_json_atomically(&options.route_receipt, &fresh_route)
+            .expect("write newer route receipt");
+        // Force a reload here rather than relying on filesystem timestamp
+        // precision; production's atomic receipt change takes this path.
+        cache.route_receipt_loaded = false;
+        cache.route_receipt_stamp = None;
+        cache.latest_event = None;
+        assert!(
+            build_with_cache(&options, &mut cache).is_err(),
+            "a fresh route input must retry immediately instead of waiting for the old retry"
+        );
+        reader_server.join().expect("rate-limited reader exits");
+        assert_eq!(
+            reader_requests.load(Ordering::SeqCst),
+            2,
+            "the fresh input must perform its own immediate reader attempt"
+        );
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn held_status_commits_matching_observer_state() {
+        let directory = fixture_directory("held-observer-status");
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        let events = directory.join("last-grpc-events.jsonl");
+        let options = offline_options(directory.clone(), events);
+        let stale_route = fixture_route_event("stale-route", "2020-01-01T00:00:00.000Z");
+        write_json_atomically(&options.route_receipt, &stale_route)
+            .expect("write stale route receipt");
+
+        let mut cache = BridgeCache::default();
+        build_with_cache(&options, &mut cache).expect("stale route publishes held status");
+        let (_, _, _, status_path, _, observer_state_path) = status_paths(&directory);
+        let status = read_json_if_present(&status_path)
+            .expect("read held status")
+            .expect("held status exists");
+        let observer_state = read_json_if_present(&observer_state_path)
+            .expect("read held observer")
+            .expect("held observer exists");
+        assert_eq!(status.get("status"), Some(&json!("held")));
+        assert_status_observer_is_coherent(&status, &observer_state);
+        fs::remove_dir_all(&directory).expect("remove fixture directory");
+    }
+
+    #[test]
     fn recognizes_orca_whirlpool_pool_state() {
         let layout = find_layout("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")
             .expect("Orca Whirlpool layout");
         assert_eq!(layout.label, "Orca Whirlpool");
         assert_eq!(layout.sizes, &[653]);
+    }
+
+    #[test]
+    fn recognizes_raydium_clmm_pool_state() {
+        let layout = find_layout("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK")
+            .expect("Raydium CLMM layout");
+        assert_eq!(layout.label, "Raydium CLMM");
+        assert_eq!(layout.sizes, &[1544]);
+        assert_eq!(layout.market_offset, 2);
+        assert_eq!(
+            layout.discriminator,
+            Some(&[0xf7, 0xed, 0xe3, 0xf5, 0xd7, 0xc3, 0xde, 0x46][..])
+        );
+    }
+
+    #[test]
+    fn raydium_clmm_requires_the_verified_pool_state_layout() {
+        let layout = find_layout("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK")
+            .expect("Raydium CLMM layout");
+        let candidate = MarketCandidate {
+            address: "clmm-pool".to_owned(),
+            expected_program_id: Some(layout.program_id.to_owned()),
+            instruction_index: Some(2),
+            dex_program_position: Some(17),
+            market_position: Some(19),
+            market_offset: Some(2),
+            account_index: Some(119),
+            source: Some("lookup_table".to_owned()),
+            writable: true,
+        };
+        let mut pool_state = vec![0_u8; 1544];
+        pool_state[..8].copy_from_slice(layout.discriminator.expect("CLMM discriminator"));
+        let valid = route_pools(
+            &json!({}),
+            &[candidate.clone()],
+            &[Account {
+                address: "clmm-pool".to_owned(),
+                owner: Some(layout.program_id.to_owned()),
+                data: Some(pool_state),
+            }],
+        )
+        .expect("valid CLMM account");
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].label, "Raydium CLMM");
+
+        let wrong_discriminator = route_pools(
+            &json!({}),
+            &[candidate.clone()],
+            &[Account {
+                address: "clmm-pool".to_owned(),
+                owner: Some(layout.program_id.to_owned()),
+                data: Some(vec![0_u8; 1544]),
+            }],
+        )
+        .expect("wrong discriminator is an ignored candidate");
+        assert!(wrong_discriminator.is_empty());
+
+        let amm_config = route_pools(
+            &json!({}),
+            &[candidate],
+            &[Account {
+                address: "clmm-amm-config".to_owned(),
+                owner: Some(layout.program_id.to_owned()),
+                data: Some(vec![0_u8; 117]),
+            }],
+        )
+        .expect("AmmConfig is an ignored candidate");
+        assert!(amm_config.is_empty());
     }
 
     #[test]
@@ -2058,7 +2724,10 @@ mod tests {
                     {"position":17,"accountIndex":117,"pubkey":POOL_LAYOUTS[3].program_id,"source":"lookup_table","writable":false},
                     {"position":10,"accountIndex":110,"pubkey":"raydium-market","source":"lookup_table","writable":true},
                     {"position":9,"accountIndex":109,"pubkey":POOL_LAYOUTS[0].program_id,"source":"lookup_table","writable":false},
-                    {"position":11,"accountIndex":111,"pubkey":"raydium-vault-not-a-market","source":"lookup_table","writable":true}
+                    {"position":11,"accountIndex":111,"pubkey":"raydium-vault-not-a-market","source":"lookup_table","writable":true},
+                    {"position":54,"accountIndex":154,"pubkey":"clmm-market","source":"lookup_table","writable":true},
+                    {"position":53,"accountIndex":153,"pubkey":"clmm-amm-config-not-a-market","source":"lookup_table","writable":false},
+                    {"position":52,"accountIndex":152,"pubkey":POOL_LAYOUTS[5].program_id,"source":"lookup_table","writable":false}
                 ]
             }]}
         });
@@ -2078,6 +2747,7 @@ mod tests {
                 "orca-market",
                 "dlmm-market-c",
                 "cpmm-market",
+                "clmm-market",
             ]
         );
         assert_eq!(
@@ -2099,13 +2769,15 @@ mod tests {
                 (Some(35), Some(36), Some(1)),
                 (Some(43), Some(44), Some(1)),
                 (Some(47), Some(49), Some(2)),
+                (Some(52), Some(54), Some(2)),
             ]
         );
         assert!(selection
             .candidates
             .iter()
             .all(|candidate| candidate.address != "cpmm-event-authority"
-                && candidate.address != "raydium-vault-not-a-market"));
+                && candidate.address != "raydium-vault-not-a-market"
+                && candidate.address != "clmm-amm-config-not-a-market"));
         assert_eq!(
             na_instruction_market_references(&event, "cpmm-market"),
             vec![json!({
