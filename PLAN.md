@@ -34,16 +34,18 @@
   -> NotArb [[markets_file]] / [[lookup_tables_file]]
 
 82.39.215.201:8899 Solana JSON-RPC (core read RPC)
-  -> inherited `LAST_READ_RPC_URL` for Rust validation
+  -> systemd-pinned `LAST_READ_RPC_URL` for Rust validation
   -> 82.23.138.51 NotArb blockhash, price, market, and ALT reads
 
 private live TOML Helius endpoint
   -> 82.23.138.51 [[spam_rpc]] spam1 transaction sending and token-account checks
 ```
 
-The production wrapper derives `LAST_READ_RPC_URL` from the private
-`[blockhash_updater]` section, whose asserted value is
-`http://82.39.215.201:8899`, rather than putting it in the Rust command line.
+The production pipeline unit pins `LAST_READ_RPC_URL` to
+`http://82.39.215.201:8899`; the private `[blockhash_updater]` section is
+asserted to the same value. A standalone local wrapper uses that TOML section
+only when the environment value is absent, and neither form puts the endpoint
+in the Rust command line.
 The private Helius URL is absent from commands, logs, and tracked
 documentation; it is used only by the token-account checker and the ordinary
 `spam1` sender.

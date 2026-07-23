@@ -27,10 +27,11 @@ The current production reader/sender contract is:
    `[lookup_table_loader]` in the ignored
    `/etc/notarb-last/notarb-last-grpc-live.toml` must all be
    `http://82.39.215.201:8899`. `assert-last-live.mjs` rejects a mismatch.
-2. `run-last-rust-pipeline.sh` derives `LAST_READ_RPC_URL` from the asserted
-   blockhash section when no local-development override is supplied and passes
-   it only as inherited process environment to the Rust bridge. The endpoint is
-   not a bridge CLI argument.
+2. The production pipeline unit pins `LAST_READ_RPC_URL` to the same 8899
+   endpoint and passes it only as inherited process environment to the Rust
+   bridge. A standalone local runner derives it from the asserted blockhash
+   section only when that environment value is absent. The endpoint is not a
+   bridge CLI argument.
 3. `[token_accounts_checker]` and `[[spam_rpc]] spam1` share the private
    indexed Helius endpoint for token-account index reads and ordinary-RPC
    sending. The 82 reader excludes this bot from its token-account secondary
@@ -224,8 +225,8 @@ absent. The current server paths are:
 When deployed, the server connects directly to `82.39.215.201:10000` for
 Yellowstone gRPC and to `http://82.39.215.201:8899` for core reads. The
 blockhash, price, market, and ALT loader sections must all use the 8899 reader,
-and the Rust bridge derives that same value without placing it in its command
-line. The token-account checker matches the private indexed Helius
+and the pipeline unit passes that same value to the Rust bridge without placing
+it in its command line. The token-account checker matches the private indexed Helius
 `[[spam_rpc]]` endpoint because the 82 reader does not index this bot wallet.
 For NotArb v1.1.2, `spam1` is
 selected through `[[spam_rpc]]` plus

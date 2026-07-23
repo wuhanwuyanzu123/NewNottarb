@@ -3,8 +3,10 @@ set -euo pipefail
 
 # WSL/Linux LAST pipeline: the Yellowstone observer is append-only, while the
 # compiled Rust bridge owns target market generation and the small lease state.
-# The private live TOML names the recovered 82 read RPC. The ordinary Helius
-# endpoint remains confined to NotArb's direct spam sender configuration.
+# Production systemd pins the recovered 82 read RPC in LAST_READ_RPC_URL. A
+# standalone local invocation without that environment derives the same value
+# from its live TOML. The ordinary Helius endpoint remains confined to
+# NotArb's direct spam sender configuration.
 
 ROOT="${LAST_ROUTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 LIVE_CONFIG="${LAST_LIVE_CONFIG:-/etc/notarb-last/notarb-last-grpc-live.toml}"
@@ -28,21 +30,16 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 127
 fi
 
-if [[ ! -r "$LIVE_CONFIG" ]]; then
-  echo '{"status":"rust_pipeline_start_failed","reason":"live_config_unreadable"}' >&2
-  exit 2
-fi
-CONFIGURED_READ_RPC="$("$NODE_BIN" "$ROOT/last-live-reader-rpc.mjs" "$LIVE_CONFIG")" || {
-  echo '{"status":"rust_pipeline_start_failed","reason":"invalid_reader_rpc"}' >&2
-  exit 2
-}
-# An explicit override is useful only for isolated local fixture work. It is
-# opt-in, so an old systemd environment file cannot accidentally change the
-# configured production reader.
-if [[ "${LAST_ROUTE_ALLOW_RPC_OVERRIDE:-false}" == "true" && -n "${LAST_READ_RPC_URL:-}" ]]; then
-  READ_RPC_URL="$LAST_READ_RPC_URL"
-else
-  READ_RPC_URL="$CONFIGURED_READ_RPC"
+READ_RPC_URL="${LAST_READ_RPC_URL:-}"
+if [[ -z "$READ_RPC_URL" ]]; then
+  if [[ ! -r "$LIVE_CONFIG" ]]; then
+    echo '{"status":"rust_pipeline_start_failed","reason":"live_config_unreadable"}' >&2
+    exit 2
+  fi
+  READ_RPC_URL="$("$NODE_BIN" "$ROOT/last-live-reader-rpc.mjs" "$LIVE_CONFIG")" || {
+    echo '{"status":"rust_pipeline_start_failed","reason":"invalid_reader_rpc"}' >&2
+    exit 2
+  }
 fi
 if [[ ! "$READ_RPC_URL" =~ ^https?:// ]]; then
   echo '{"status":"rust_pipeline_start_failed","reason":"invalid_reader_rpc"}' >&2

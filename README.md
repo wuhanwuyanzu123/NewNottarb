@@ -29,7 +29,7 @@ services without a local SSH forward:
   -> activity-gated NotArb supervisor
 
 82.39.215.201:8899 Solana JSON-RPC (core read RPC)
-  -> inherited `LAST_READ_RPC_URL` for Rust market-state/ALT validation
+  -> systemd-pinned `LAST_READ_RPC_URL` for Rust market-state/ALT validation
   -> 82.23.138.51 NotArb blockhash, price, market, and ALT reader roles
 
 Private live TOML Helius endpoint
@@ -39,8 +39,9 @@ Private live TOML Helius endpoint
 
 The four core NotArb reader roles are `[blockhash_updater]`,
 `[price_updater]`, `[market_loader]`, and `[lookup_table_loader]`. Production
-requires all four to use `http://82.39.215.201:8899`; the bridge inherits that
-same value as `LAST_READ_RPC_URL`. `[token_accounts_checker]` and
+requires all four to use `http://82.39.215.201:8899`; the production pipeline
+unit pins that same value as `LAST_READ_RPC_URL` (a standalone local runner
+uses the asserted TOML fallback). `[token_accounts_checker]` and
 `[[spam_rpc]] spam1` instead share the private indexed Helius endpoint because
 the 82 reader excludes this bot from token-account secondary indexes. The
 literal Helius endpoint stays only in the mode-`0600` live TOML: do not put it
