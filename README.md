@@ -320,6 +320,15 @@ four core reader/load sections remain on `http://82.39.215.201:8899`. Priority
 fees remain capped at 25,000 lamports and the cooldown is
 1,000 ms.
 
+Each Linux live-child launch also starts a best-effort, non-blocking
+fee-payer preflight. It derives the public key from `[user].keypair_path`
+locally and sends one `getBalance` request only to the configured
+`[blockhash_updater]` reader (`82.39.215.201:8899` for this profile). It never
+signs, simulates, or sends. A JSON log with
+`status: "last_live_fee_payer_unfunded"` means the fee payer has zero lamports,
+so Solana network and priority fees cannot be paid; the Java child still starts
+normally so this diagnostic cannot hold up a fresh LAST route lease.
+
 ## Runtime evidence
 
 Git intentionally ignores the high-frequency runtime evidence:

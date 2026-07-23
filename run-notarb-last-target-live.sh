@@ -39,6 +39,12 @@ fi
 export LAST_READ_RPC_URL
 "$NODE_BIN" "$ROOT/assert-last-live.mjs" "$CONFIG" >>"$OUT_LOG" 2>>"$ERR_LOG"
 
+# Diagnose an unfunded fee payer without holding up the active lease or the
+# Java child.  The helper derives the public key from the configured local
+# keypair and calls only [blockhash_updater].rpc_url; it never signs or sends.
+# Do not wait for it: a transient reader failure must not stop NotArb.
+"$NODE_BIN" "$ROOT/last-live-fee-payer-preflight.mjs" "$CONFIG" >>"$OUT_LOG" 2>>"$ERR_LOG" &
+
 # Prefer an official Linux NotArb launcher when one is installed.  The 82.23
 # deployment also carries the cross-platform NotArb JAR, so retain the same
 # `create-cmd` bootstrap protocol used by the Windows launcher as a fallback.

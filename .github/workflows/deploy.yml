@@ -47,6 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           npm run test:last:live-reader-rpc
+          npm run test:last:fee-payer-preflight
           npm run test:last:live-config
           npm run test:last:live-config-migration
           npm run test:last:atomic-write
