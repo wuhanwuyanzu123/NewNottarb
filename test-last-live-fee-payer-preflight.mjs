@@ -2,10 +2,12 @@
 // Offline contract for the Linux fee-payer diagnostic.  All RPC responses are
 // injected, so this test never connects to a public or private endpoint.
 
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import {
   base58Encode,
   configuredFeePayerInputs,
@@ -18,6 +20,7 @@ const expectedFeePayer = '11111111111111111111111111111111';
 const directory = await mkdtemp(join(tmpdir(), 'last-live-fee-payer-preflight-'));
 const configPath = join(directory, 'live.toml');
 const keypairPath = join(directory, 'fee-payer.json');
+const execFileAsync = promisify(execFile);
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
@@ -94,7 +97,36 @@ try {
     'fee_payer_preflight_not_backgrounded',
   );
 
-  console.log(JSON.stringify({ status: 'last_live_fee_payer_preflight_test_passed' }));
+  // The deployment invokes this helper through /opt/notarb-last/current,
+  // which is a symlink to a release. Confirm the ESM entry-point guard still
+  // emits its normal JSON diagnostic when the script itself is reached through
+  // a symlink. The deliberately missing config keeps this fully offline.
+  const helperPath = join(root, 'last-live-fee-payer-preflight.mjs');
+  const symlinkPath = join(directory, 'current-last-live-fee-payer-preflight.mjs');
+  let symlinkInvocation = 'passed';
+  try {
+    await symlink(helperPath, symlinkPath, process.platform === 'win32' ? 'file' : undefined);
+    const invoked = await execFileAsync(process.execPath, [symlinkPath, join(directory, 'missing-live.toml')], {
+      cwd: directory,
+    });
+    assert(invoked.stderr === '', 'symlink_entrypoint_wrote_stderr');
+    const record = JSON.parse(invoked.stdout.trim());
+    assert(
+      record.status === 'last_live_fee_payer_preflight_unavailable'
+        && record.reason === 'live_config_read_failed',
+      'symlink_entrypoint_did_not_emit_diagnostic',
+    );
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOTSUP', 'ENOSYS'].includes(error?.code)) {
+      // Some Windows hosts disable creation of developer-mode file symlinks.
+      // Linux deployment and CI still execute the full branch above.
+      symlinkInvocation = 'unsupported';
+    } else {
+      throw error;
+    }
+  }
+
+  console.log(JSON.stringify({ status: 'last_live_fee_payer_preflight_test_passed', symlinkInvocation }));
 } finally {
   await rm(directory, { recursive: true, force: true });
 }

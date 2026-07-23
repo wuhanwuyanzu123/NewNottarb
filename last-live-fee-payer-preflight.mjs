@@ -6,7 +6,7 @@
 // successfully even when the diagnostic itself is unavailable: the caller
 // starts it in the background and must not delay the live child.
 
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -216,6 +216,25 @@ async function main() {
   process.stdout.write(`${JSON.stringify(record)}\n`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+async function invokedAsMain() {
+  if (!process.argv[1]) return false;
+
+  const invokedPath = resolve(process.argv[1]);
+  const modulePath = fileURLToPath(import.meta.url);
+  if (invokedPath === modulePath) return true;
+
+  // `/opt/notarb-last/current` is a symlink to an immutable release.  Node's
+  // ESM URL can resolve that link while argv[1] keeps its lexical path, so use
+  // canonical filesystem paths before deciding whether to run the CLI entry.
+  // A failed canonicalization means this module was imported or its invocation
+  // path is gone; in either case it must not execute a diagnostic implicitly.
+  try {
+    return (await realpath(invokedPath)) === (await realpath(modulePath));
+  } catch {
+    return false;
+  }
+}
+
+if (await invokedAsMain()) {
   await main();
 }
