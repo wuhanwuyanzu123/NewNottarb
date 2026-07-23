@@ -48,7 +48,11 @@ path = "last-target-markets.json"
 update_seconds = 5
 
 [wsol_unwrapper]
-enabled = false
+enabled = true
+# Required when enabled: read the native SOL balance from the route reader and
+# submit a maintenance unwrap through the same private sender used by swaps.
+reader_rpc_url = "http://82.39.215.201:8899"
+sender_rpc_urls = ["https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY"]
 
 [notarb_markets]
 enabled = false

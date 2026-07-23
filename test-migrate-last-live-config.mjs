@@ -46,11 +46,19 @@ try {
     .replaceAll('https://mainnet.helius-rpc.com/?api-key=REPLACE_WITH_HELIUS_API_KEY', heliusUrl);
   // Model the deployed predecessor: direct reader URLs plus the old spam-RPC
   // schema. Migration must preserve the private sender/token-index URL while
-  // moving the four core read roles to the recovered 82 reader.
+  // moving the four core read roles and unwrap reader to the recovered 82
+  // reader. Its legacy unwrap section has a disabled switch, a stale reader,
+  // and no sender RPC list.
+  const legacyUnwrapper = [
+    '[wsol_unwrapper]',
+    'enabled = false',
+    `reader_rpc_url = "${heliusUrl}"`,
+  ].join('\n');
   const hybrid = configured
     .replaceAll(readerUrl, heliusUrl)
     .replace('threads = 0', 'threads = 1')
     .replace('delay_ms = 1000', 'delay_ms = 250')
+    .replace(/\[wsol_unwrapper\][\s\S]*?(?=\n\[notarb_markets\])/, legacyUnwrapper)
     .replace(/^\[\[sender\]\]$/m, '[[spam_rpc]]')
     .replace(
       /^(\[\[spam_rpc\]\][\s\S]*?^url\s*=\s*"https:\/\/mainnet\.helius-rpc\.com\/\?api-key=fixture-indexed-key")/m,
@@ -71,8 +79,15 @@ try {
   if (`${migrated.stdout}${migrated.stderr}`.includes(heliusUrl)) {
     throw new Error('migration_output_exposed_private_sender_url');
   }
-  if (!migrated.stdout.includes('blockhash_updater_delay_ms')) {
-    throw new Error(`blockhash_delay_not_migrated:${migrated.stderr || migrated.stdout}`);
+  for (const change of [
+    'blockhash_updater_delay_ms',
+    'wsol_unwrapper_enabled',
+    'wsol_unwrapper_reader_rpc',
+    'wsol_unwrapper_sender_rpc_urls',
+  ]) {
+    if (!migrated.stdout.includes(change)) {
+      throw new Error(`expected_change_not_reported:${change}:${migrated.stderr || migrated.stdout}`);
+    }
   }
   const migratedText = await readFile(configPath, 'utf8');
   for (const expected of [
@@ -98,6 +113,19 @@ try {
     : tokenRest.slice(0, tokenEnd < 0 ? tokenRest.length : tokenEnd).join('\n');
   if (!tokenChecker.includes(`rpc_url = "${heliusUrl}"`)) {
     throw new Error('token_checker_not_migrated_to_sender');
+  }
+  const unwrapStart = tokenLines.findIndex((line) => line.trim() === '[wsol_unwrapper]');
+  const unwrapRest = unwrapStart < 0 ? [] : tokenLines.slice(unwrapStart + 1);
+  const unwrapEnd = unwrapRest.findIndex((line) => /^\s*\[/.test(line));
+  const unwrapConfig = unwrapStart < 0
+    ? ''
+    : unwrapRest.slice(0, unwrapEnd < 0 ? unwrapRest.length : unwrapEnd).join('\n');
+  for (const expected of [
+    'enabled = true',
+    `reader_rpc_url = "${readerUrl}"`,
+    `sender_rpc_urls = ["${heliusUrl}"]`,
+  ]) {
+    if (!unwrapConfig.includes(expected)) throw new Error(`unwrap_not_migrated:${expected}`);
   }
   for (const section of ['blockhash_updater', 'price_updater', 'market_loader', 'lookup_table_loader']) {
     const expression = new RegExp(`\\[${section.replace('.', '\\.') }\\][\\s\\S]*?rpc_url\\s*=\\s*"${readerUrl.replace(/[./]/g, '\\$&')}"`);

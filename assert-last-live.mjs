@@ -76,7 +76,6 @@ try {
 // In NotArb v1.1.2, zero selects the dynamic cached executor thread pool; it
 // does not disable the enabled sender/swap execution path.
 expect(exactlyOne('transaction_executor'), 'threads', '0');
-expect(exactlyOne('wsol_unwrapper'), 'enabled', 'false');
 const tokenAccounts = exactlyOne('token_accounts_checker');
 const tokenAccountsRpc = stringValue(tokenAccounts, 'rpc_url');
 if (!isConfiguredHeliusMainnetRpc(tokenAccountsRpc)) {
@@ -111,6 +110,14 @@ if (!isConfiguredHeliusMainnetRpc(sendingRpcUrl)) {
 }
 if (tokenAccountsRpc !== sendingRpcUrl) {
   fail('[token_accounts_checker] rpc_url must exactly match the [[sender]] spam1 url.');
+}
+const wsolUnwrapper = exactlyOne('wsol_unwrapper');
+expect(wsolUnwrapper, 'enabled', 'true');
+if (stringValue(wsolUnwrapper, 'reader_rpc_url') !== configuredReadRpc) {
+  fail(`[wsol_unwrapper] reader_rpc_url must be ${configuredReadRpc}.`);
+}
+if (singleTomlStringArray(wsolUnwrapper, 'sender_rpc_urls') !== sendingRpcUrl) {
+  fail('[wsol_unwrapper] sender_rpc_urls must contain only the configured sender URL.');
 }
 const swap = exactlyOne('swap');
 expect(swap, 'enabled', 'true');
@@ -156,6 +163,13 @@ function integerValue(sectionValue, key) {
     fail(`[${sectionValue.name}] ${key} must be a safe TOML integer.`);
   }
   return parsed;
+}
+
+function singleTomlStringArray(sectionValue, key) {
+  const value = sectionValue.values.get(key)?.trim();
+  const match = value?.match(/^\[\s*"([^"\r\n]+)"\s*\]$/);
+  if (!match) fail(`[${sectionValue.name}] ${key} must be a single string array.`);
+  return match[1];
 }
 
 function parseStrategySenders(value) {

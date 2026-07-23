@@ -90,6 +90,21 @@ for (const readerName of ['blockhash_updater', 'price_updater', 'market_loader',
   }
 }
 
+const wsolUnwrapper = document.exactlyOne('wsol_unwrapper');
+for (const [key, expectedValue, change] of [
+  ['enabled', 'true', 'wsol_unwrapper_enabled'],
+  ['reader_rpc_url', JSON.stringify(LAST_READER_RPC), 'wsol_unwrapper_reader_rpc'],
+  ['sender_rpc_urls', JSON.stringify([senderUrl]), 'wsol_unwrapper_sender_rpc_urls'],
+]) {
+  if (!wsolUnwrapper.has(key)) {
+    wsolUnwrapper.addValue(key, expectedValue);
+    changes.push(change);
+  } else if (wsolUnwrapper.value(key) !== expectedValue) {
+    wsolUnwrapper.setValue(key, expectedValue);
+    changes.push(change);
+  }
+}
+
 const strategy = document.exactlyOne('swap.strategy');
 if (strategy.has('senders') && strategy.has('spam_senders')) {
   fail('The strategy contains both senders and spam_senders.');
@@ -264,6 +279,20 @@ class TomlSection {
     const assignment = this.assignment(key);
     if (!assignment) return;
     this.document.lines[assignment.index] = '';
+  }
+
+  addValue(key, value) {
+    const insertionIndex = this.end;
+    const newline = this.document.lines[insertionIndex - 1]?.endsWith('\r\n') ? '\r\n' : '\n';
+    this.document.lines.splice(insertionIndex, 0, `${key} = ${value}${newline}`);
+    for (const section of this.document.sections) {
+      if (section.start >= insertionIndex) {
+        section.start += 1;
+        section.end += 1;
+      } else if (section.end >= insertionIndex) {
+        section.end += 1;
+      }
+    }
   }
 
   rename(name) {

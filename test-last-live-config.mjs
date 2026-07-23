@@ -74,6 +74,21 @@ try {
   );
 
   await expectInvalid(
+    'wsol_unwrapper_disabled',
+    config.replace('[wsol_unwrapper]\nenabled = true', '[wsol_unwrapper]\nenabled = false'),
+    '[wsol_unwrapper] enabled must be true',
+  );
+
+  await expectInvalid(
+    'wsol_unwrapper_sender_mismatch',
+    config.replace(
+      'sender_rpc_urls = ["https://mainnet.helius-rpc.com/?api-key=fixture-indexed-key"]',
+      'sender_rpc_urls = ["https://mainnet.helius-rpc.com/?api-key=other-sender-key"]',
+    ),
+    '[wsol_unwrapper] sender_rpc_urls must contain only the configured sender URL',
+  );
+
+  await expectInvalid(
     'blockhash_delay_below_minimum',
     config.replace('delay_ms = 1000', 'delay_ms = 999'),
     '[blockhash_updater] delay_ms must be at least 1000',
