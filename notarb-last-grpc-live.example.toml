@@ -77,8 +77,9 @@ flash_loan = true
 [[swap.strategy]]
 enabled = true
 cu_limit = 369100
-min_priority_fee_lamports = 1000
-max_priority_fee_lamports = 25000
+# 563–3,593 micro-lamports per CU at this CU limit.
+min_priority_fee_lamports = 208
+max_priority_fee_lamports = 1326
 cooldown_ms = 1000
 # The onchain-bot sender map resolves this [[sender]] id. Leave
 # require_profit out: it is optional and the strategy's regular evaluator

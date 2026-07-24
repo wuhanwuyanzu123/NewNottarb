@@ -333,7 +333,8 @@ The enabled `[[sender]] spam1` is selected by
 `max_retries = 0`, omits `require_profit`, and has no Jito tip. The private
 endpoint backs only `token_accounts_checker` and this `[[sender]]`; all four
 core reader/load sections remain on `http://82.39.215.201:8899`. Priority fees
-remain capped at 25,000 lamports and the cooldown is 1,000 ms.
+use a 563–3,593 µlamports/CU range, bounded at 208–1,326 lamports for the
+369,100-CU limit; the cooldown is 1,000 ms.
 
 For runtime proof, follow a fresh live-child log interval rather than reading
 old accumulated output:

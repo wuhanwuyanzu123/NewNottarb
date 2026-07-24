@@ -529,7 +529,8 @@ the sender/swap execution path remains enabled.
 It keeps `[notarb_markets] enabled = false`, loading only the current
 `last-target-markets.json` and `last-target-lookup-tables.txt` written by the
 LAST bridge. The profile omits `require_profit`, keeps a 1,000 ms cooldown,
-and a 25,000-lamport priority-fee cap; ordinary RPC sends have no Jito tip.
+and a 563–3,593 µlamports/CU range with matching 208–1,326-lamport fee bounds;
+ordinary RPC sends have no Jito tip.
 
 The live child starts only for a fresh bridge-validated LAST route and stops
 when the lease becomes quiet, held, stale, or incoherent. Its logs are

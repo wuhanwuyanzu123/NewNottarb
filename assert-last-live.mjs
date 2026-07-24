@@ -137,8 +137,8 @@ if (strategySenders.get('id') !== '"spam1"'
   fail('[[swap.strategy]] senders must use only id=spam1 with max_retries=0.');
 }
 expect(strategy, 'cu_limit', '369100');
-expect(strategy, 'min_priority_fee_lamports', '1000');
-expect(strategy, 'max_priority_fee_lamports', '25000');
+expect(strategy, 'min_priority_fee_lamports', '208');
+expect(strategy, 'max_priority_fee_lamports', '1326');
 expect(strategy, 'cooldown_ms', '1000');
 
 console.log(JSON.stringify({
